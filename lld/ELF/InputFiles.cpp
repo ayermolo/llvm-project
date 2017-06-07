@@ -278,6 +278,10 @@ bool elf::ObjectFile<ELFT>::shouldMerge(const Elf_Shdr &Sec) {
   return Sec.sh_addralign <= EntSize;
 }
 
+namespace {
+bool DontReadODRTab = getenv("DONT_READ_ODRTAB");
+}
+
 template <class ELFT>
 void elf::ObjectFile<ELFT>::initializeSections(
     DenseSet<CachedHashStringRef> &ComdatGroups) {
@@ -335,6 +339,11 @@ void elf::ObjectFile<ELFT>::initializeSections(
     case SHT_SYMTAB_SHNDX:
       this->SymtabSHNDX =
           check(Obj.getSHNDXTable(Sec, ObjSections), toString(this));
+      break;
+    case SHT_LLVM_ODRTAB:
+      if (!DontReadODRTab)
+        elf::Symtab<ELFT>::X->addODRTable(
+            this, check(Obj.getSectionContents(&Sec), toString(this)));
       break;
     case SHT_STRTAB:
     case SHT_NULL:

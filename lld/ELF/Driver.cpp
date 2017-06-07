@@ -990,6 +990,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &Args) {
   // Apply symbol renames for -wrap and -defsym
   Symtab.applySymbolRenames();
 
+  Symtab.startODRChecker();
+
   // Now that we have a complete list of input files.
   // Beyond this point, no new files are added.
   // Aggregate all input sections into one place.

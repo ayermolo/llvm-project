@@ -92,6 +92,13 @@ static void GetObjCImageInfo(Module &M, unsigned &Version, unsigned &Flags,
 
 void TargetLoweringObjectFileELF::emitModuleMetadata(
     MCStreamer &Streamer, Module &M, const TargetMachine &TM) const {
+  auto &C = getContext();
+  if (auto *ODRTables = M.getNamedMetadata("llvm.odrtab")) {
+    Streamer.SwitchSection(C.getELFSection(".odrtab", ELF::SHT_LLVM_ODRTAB, 0));
+    for (MDNode *Table : ODRTables->operands())
+      Streamer.EmitBytes(cast<MDString>(Table->getOperand(0))->getString());
+  }
+
   unsigned Version = 0;
   unsigned Flags = 0;
   StringRef Section;
@@ -100,7 +107,6 @@ void TargetLoweringObjectFileELF::emitModuleMetadata(
   if (Section.empty())
     return;
 
-  auto &C = getContext();
   auto *S = C.getELFSection(Section, ELF::SHT_PROGBITS, ELF::SHF_ALLOC);
   Streamer.SwitchSection(S);
   Streamer.EmitLabel(C.getOrCreateSymbol(StringRef("OBJC_IMAGE_INFO")));

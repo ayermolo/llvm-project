@@ -715,6 +715,10 @@ def fdebug_pass_arguments : Flag<["-"], "fdebug-pass-arguments">, Group<f_Group>
 def fdebug_pass_structure : Flag<["-"], "fdebug-pass-structure">, Group<f_Group>;
 def fdepfile_entry : Joined<["-"], "fdepfile-entry=">,
     Group<f_clang_Group>, Flags<[CC1Option]>;
+def fdetect_odr_violations : Flag<["-"], "fdetect-odr-violations">,
+    Group<f_clang_Group>, Flags<[CoreOption, CC1Option]>;
+def fno_detect_odr_violations : Flag<["-"], "fno-detect-odr-violations">,
+    Group<f_clang_Group>, Flags<[CoreOption]>;
 def fdiagnostics_fixit_info : Flag<["-"], "fdiagnostics-fixit-info">, Group<f_clang_Group>;
 def fdiagnostics_parseable_fixits : Flag<["-"], "fdiagnostics-parseable-fixits">, Group<f_clang_Group>,
     Flags<[CoreOption, CC1Option]>, HelpText<"Print fix-its in machine parseable form">;

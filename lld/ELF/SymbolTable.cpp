@@ -750,6 +750,26 @@ template <class ELFT> void SymbolTable<ELFT>::scanVersionScript() {
       assignWildcardVersion(Ver, V.Id);
 }
 
+template <class ELFT> void SymbolTable<ELFT>::startODRChecker() {
+  ODRCheckerThread = std::thread([&]() {
+    ODRDiags = check(odrtable::check(ODRTables));
+  });
+}
+
+template <class ELFT> void SymbolTable<ELFT>::finishODRChecker() {
+  ODRCheckerThread.join();
+  for (odrtable::Diag &Diag : ODRDiags) {
+    std::string MsgStr;
+    llvm::raw_string_ostream Msg(MsgStr);
+    Msg << "ODR violation detected: " << Diag.Name;
+    for (odrtable::Diag::Def &Def : Diag.Defs)
+      Msg << "\n>>> defined at " << Def.File << ":" << Def.Line
+          << "\n               "
+          << toString(static_cast<InputFile *>(Def.Source));
+    warn(Msg.str());
+  }
+}
+
 template class elf::SymbolTable<ELF32LE>;
 template class elf::SymbolTable<ELF32BE>;
 template class elf::SymbolTable<ELF64LE>;

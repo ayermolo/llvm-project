@@ -61,15 +61,16 @@ Error zlib::compress(StringRef InputBuffer,
                      SmallVectorImpl<char> &CompressedBuffer,
                      CompressionLevel Level) {
   unsigned long CompressedSize = ::compressBound(InputBuffer.size());
-  CompressedBuffer.resize(CompressedSize);
+  size_t OldSize = CompressedBuffer.size();
+  CompressedBuffer.resize(OldSize + CompressedSize);
   int CLevel = encodeZlibCompressionLevel(Level);
-  int Res = ::compress2((Bytef *)CompressedBuffer.data(), &CompressedSize,
-                        (const Bytef *)InputBuffer.data(), InputBuffer.size(),
-                        CLevel);
+  int Res = ::compress2((Bytef *)CompressedBuffer.data() + OldSize,
+                        &CompressedSize, (const Bytef *)InputBuffer.data(),
+                        InputBuffer.size(), CLevel);
   // Tell MemorySanitizer that zlib output buffer is fully initialized.
   // This avoids a false report when running LLVM with uninstrumented ZLib.
   __msan_unpoison(CompressedBuffer.data(), CompressedSize);
-  CompressedBuffer.resize(CompressedSize);
+  CompressedBuffer.resize(OldSize + CompressedSize);
   return Res ? createError(convertZlibCodeToString(Res)) : Error::success();
 }
 

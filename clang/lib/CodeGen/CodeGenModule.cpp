@@ -380,6 +380,25 @@ void InstrProfStats::reportDiagnostics(DiagnosticsEngine &Diags,
   }
 }
 
+void CodeGenModule::EmitODRTable() {
+  if (!CodeGenOpts.DetectODRViolations)
+    return;
+
+  SmallVector<char, 0> TheODRTab;
+  if (llvm::Error Err =
+          ODRTab.build(getClangFullRepositoryVersion(), TheODRTab)) {
+    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error,
+                                            "could not create ODR table: %0");
+    Diags.Report(DiagID) << toString(std::move(Err));
+    return;
+  }
+
+  llvm::MDString *MDStr =
+      llvm::MDString::get(VMContext, {TheODRTab.data(), TheODRTab.size()});
+  llvm::MDNode *MDN = llvm::MDNode::get(VMContext, {MDStr});
+  TheModule.getOrInsertNamedMetadata("llvm.odrtab")->addOperand(MDN);
+}
+
 void CodeGenModule::Release() {
   EmitDeferred();
   EmitVTablesOpportunistically();
@@ -426,6 +445,8 @@ void CodeGenModule::Release() {
   emitLLVMUsed();
   if (SanStats)
     SanStats->finish();
+
+  EmitODRTable();
 
   if (CodeGenOpts.Autolink &&
       (Context.getLangOpts().Modules || !LinkerOptionsMetadata.empty())) {
@@ -3887,18 +3908,36 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
   case Decl::Namespace:
     EmitDeclContext(cast<NamespaceDecl>(D));
     break;
-  case Decl::CXXRecord:
+  case Decl::CXXRecord: {
+    auto *RD = cast<CXXRecordDecl>(D);
     if (DebugInfo) {
       if (auto *ES = D->getASTContext().getExternalSource())
         if (ES->hasExternalDefinitions(D) == ExternalASTSource::EK_Never)
           DebugInfo->completeUnusedClass(cast<CXXRecordDecl>(*D));
     }
+
     // Emit any static data members, they may be definitions.
     for (auto *I : cast<CXXRecordDecl>(D)->decls())
       if (isa<VarDecl>(I) || isa<CXXRecordDecl>(I))
         EmitTopLevelDecl(I);
+
+    // Add this declaration to the ODR table.
+    if (CodeGenOpts.DetectODRViolations && RD->isExternallyVisible() &&
+        RD->isThisDeclarationADefinition()) {
+      std::string NameStr;
+      llvm::raw_string_ostream Name(NameStr);
+      getCXXABI().getMangleContext().mangleTypeName(
+          QualType(RD->getTypeForDecl(), 0), Name);
+
+      PresumedLoc PLoc =
+          Context.getSourceManager().getPresumedLoc(RD->getLocation());
+      ODRTab.add(Name.str(), PLoc.getFilename(), PLoc.getLine(),
+                 RD->getODRHash());
+    }
+
     break;
     // No code generation needed.
+  }
   case Decl::UsingShadow:
   case Decl::ClassTemplate:
   case Decl::VarTemplate:

@@ -15,6 +15,8 @@
 #include "Strings.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/BinaryFormat/ODRTable.h"
+#include "llvm/Support/thread.h"
 
 namespace lld {
 namespace elf {
@@ -89,6 +91,12 @@ public:
 
   void trace(StringRef Name);
 
+  void addODRTable(InputFile *File, ArrayRef<uint8_t> ODRTab) {
+    ODRTables.push_back({static_cast<void *>(File), ODRTab});
+  }
+  void startODRChecker();
+  void finishODRChecker();
+
 private:
   std::vector<SymbolBody *> findByVersion(SymbolVersion Ver);
   std::vector<SymbolBody *> findAllByVersion(SymbolVersion Ver);
@@ -136,6 +144,11 @@ private:
 
   // For LTO.
   std::unique_ptr<BitcodeCompiler> LTO;
+
+  // For the ODR checker.
+  std::vector<llvm::odrtable::InputFile> ODRTables;
+  llvm::thread ODRCheckerThread;
+  std::vector<llvm::odrtable::Diag> ODRDiags;
 };
 
 template <class ELFT> struct Symtab { static SymbolTable<ELFT> *X; };

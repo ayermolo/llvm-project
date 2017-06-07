@@ -2837,6 +2837,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                     options::OPT_fno_unique_section_names, true))
     CmdArgs.push_back("-fno-unique-section-names");
 
+  if (Args.hasFlag(options::OPT_fdetect_odr_violations,
+                   options::OPT_fno_detect_odr_violations, false))
+    CmdArgs.push_back("-fdetect-odr-violations");
+
   Args.AddAllArgs(CmdArgs, options::OPT_finstrument_functions);
 
   addPGOAndCoverageFlags(C, D, Output, Args, CmdArgs);
