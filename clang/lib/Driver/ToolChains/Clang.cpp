@@ -6228,6 +6228,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-fdata-sections");
   }
 
+  if (Args.hasFlag(options::OPT_fdetect_odr_violations,
+                   options::OPT_fno_detect_odr_violations, false))
+    CmdArgs.push_back("-fdetect-odr-violations");
+
   Args.addOptOutFlag(CmdArgs, options::OPT_funique_section_names,
                      options::OPT_fno_unique_section_names);
   Args.addOptInFlag(CmdArgs, options::OPT_fseparate_named_sections,

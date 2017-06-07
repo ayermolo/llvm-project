@@ -3023,6 +3023,8 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   // Replace common symbols with regular symbols.
   replaceCommonSymbols();
 
+  symtab.startODRChecker();
+
   {
     llvm::TimeTraceScope timeScope("Aggregate sections");
     // Now that we have a complete list of input files.

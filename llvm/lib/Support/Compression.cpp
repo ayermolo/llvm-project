@@ -106,18 +106,19 @@ bool zlib::isAvailable() { return true; }
 
 void zlib::compress(ArrayRef<uint8_t> Input,
                     SmallVectorImpl<uint8_t> &CompressedBuffer, int Level) {
+  size_t OldSize = CompressedBuffer.size();
   unsigned long CompressedSize = ::compressBound(Input.size());
-  CompressedBuffer.resize_for_overwrite(CompressedSize);
-  int Res = ::compress2((Bytef *)CompressedBuffer.data(), &CompressedSize,
-                        (const Bytef *)Input.data(), Input.size(), Level);
+  CompressedBuffer.resize_for_overwrite(OldSize + CompressedSize);
+  int Res = ::compress2((Bytef *)CompressedBuffer.data() + OldSize,
+                        &CompressedSize, (const Bytef *)Input.data(),
+                        Input.size(), Level);
   if (Res == Z_MEM_ERROR)
     report_bad_alloc_error("Allocation failed");
   assert(Res == Z_OK);
   // Tell MemorySanitizer that zlib output buffer is fully initialized.
   // This avoids a false report when running LLVM with uninstrumented ZLib.
   __msan_unpoison(CompressedBuffer.data(), CompressedSize);
-  if (CompressedSize < CompressedBuffer.size())
-    CompressedBuffer.truncate(CompressedSize);
+  CompressedBuffer.resize(OldSize + CompressedSize);
 }
 
 Error zlib::decompress(ArrayRef<uint8_t> Input, uint8_t *Output,

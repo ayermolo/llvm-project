@@ -337,3 +337,23 @@ void SymbolTable::scanVersionScript() {
 Symbol *SymbolTable::addUnusedUndefined(StringRef name, uint8_t binding) {
   return addSymbol(Undefined{ctx.internalFile, name, binding, STV_DEFAULT, 0});
 }
+
+void SymbolTable::startODRChecker() {
+  ODRCheckerThread = llvm::thread([&]() {
+    ODRDiags = check(odrtable::check(ODRTables));
+  });
+}
+
+void SymbolTable::finishODRChecker() {
+  ODRCheckerThread.join();
+  for (odrtable::Diag &diag : ODRDiags) {
+    std::string msgStr;
+    llvm::raw_string_ostream msg(msgStr);
+    msg << "ODR violation detected: " << diag.Name;
+    for (odrtable::Diag::Def &Def : diag.Defs)
+      msg << "\n>>> defined at " << Def.File << ":" << Def.Line
+          << "\n               "
+          << toString(static_cast<InputFile *>(Def.Source));
+    warn(msg.str());
+  }
+}

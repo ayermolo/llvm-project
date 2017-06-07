@@ -34,6 +34,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/BinaryFormat/ODRTable.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Utils/SanitizerStats.h"
@@ -619,6 +620,8 @@ private:
   // when used with -fincremental-extensions.
   std::pair<std::unique_ptr<CodeGenFunction>, const TopLevelStmtDecl *>
       GlobalTopLevelStmtBlockInFlight;
+
+  llvm::odrtable::Builder ODRTab;
 
   llvm::DenseMap<GlobalDecl, uint16_t> PtrAuthDiscriminatorHashes;
 
@@ -1819,6 +1822,8 @@ private:
   void EmitStaticExternCAliases();
 
   void EmitDeclMetadata();
+
+  void EmitODRTable();
 
   /// Emit the Clang version as llvm.ident metadata.
   void EmitVersionIdentMetadata();

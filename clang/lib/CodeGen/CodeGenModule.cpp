@@ -75,6 +75,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/TargetParser/X86TargetParser.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
+#include <cstdint>
 #include <optional>
 
 using namespace clang;
@@ -844,6 +845,25 @@ static bool isStackProtectorOn(const LangOptions &LangOpts,
   return LangOpts.getStackProtector() == Mode;
 }
 
+void CodeGenModule::EmitODRTable() {
+  if (!CodeGenOpts.DetectODRViolations)
+    return;
+
+  SmallVector<uint8_t, 0> TheODRTab;
+  if (llvm::Error Err =
+          ODRTab.build(getClangFullRepositoryVersion(), TheODRTab)) {
+    unsigned DiagID = Diags.getCustomDiagID(DiagnosticsEngine::Error,
+                                            "could not create ODR table: %0");
+    Diags.Report(DiagID) << toString(std::move(Err));
+    return;
+  }
+
+  llvm::MDString *MDStr =
+      llvm::MDString::get(VMContext, {reinterpret_cast<char *>(TheODRTab.data()), TheODRTab.size()});
+  llvm::MDNode *MDN = llvm::MDNode::get(VMContext, {MDStr});
+  TheModule.getOrInsertNamedMetadata("llvm.odrtab")->addOperand(MDN);
+}
+
 void CodeGenModule::Release() {
   Module *Primary = getContext().getCurrentNamedModule();
   if (CXX20ModuleInits && Primary && !Primary->isHeaderLikeModule())
@@ -972,6 +992,8 @@ void CodeGenModule::Release() {
   emitLLVMUsed();
   if (SanStats)
     SanStats->finish();
+
+  EmitODRTable();
 
   if (CodeGenOpts.Autolink &&
       (Context.getLangOpts().Modules || !LinkerOptionsMetadata.empty())) {
@@ -6925,6 +6947,19 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     for (auto *I : CRD->decls())
       if (isa<VarDecl>(I) || isa<CXXRecordDecl>(I))
         EmitTopLevelDecl(I);
+    // Add this declaration to the ODR table.
+    if (CodeGenOpts.DetectODRViolations && CRD->isExternallyVisible() &&
+        CRD->isThisDeclarationADefinition()) {
+      std::string NameStr;
+      llvm::raw_string_ostream Name(NameStr);
+      getCXXABI().getMangleContext().mangleCanonicalTypeName(
+          QualType(CRD->getTypeForDecl(), 0), Name);
+
+      PresumedLoc PLoc =
+          Context.getSourceManager().getPresumedLoc(CRD->getLocation());
+      ODRTab.add(Name.str(), PLoc.getFilename(), PLoc.getLine(),
+                 CRD->getODRHash());
+    }
     break;
   }
     // No code generation needed.

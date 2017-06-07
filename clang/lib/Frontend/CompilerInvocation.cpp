@@ -2225,6 +2225,8 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
   if (!Opts.EmitIEEENaNCompliantInsts && !LangOptsRef.NoHonorNaNs)
     Diags.Report(diag::err_drv_amdgpu_ieee_without_no_honor_nans);
 
+  Opts.DetectODRViolations = Args.hasArg(OPT_fdetect_odr_violations);
+
   return Diags.getNumErrors() == NumErrorsBefore;
 }
 

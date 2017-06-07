@@ -13,6 +13,8 @@
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/BinaryFormat/ODRTable.h"
+#include "llvm/Support/thread.h"
 
 namespace lld::elf {
 
@@ -80,6 +82,12 @@ public:
   // output Arm CMSE import library.
   llvm::StringMap<bool> inCMSEOutImpLib;
 
+  void addODRTable(InputFile *File, ArrayRef<uint8_t> ODRTab) {
+    ODRTables.push_back({static_cast<void *>(File), ODRTab});
+  }
+  void startODRChecker();
+  void finishODRChecker();
+
 private:
   SmallVector<Symbol *, 0> findByVersion(SymbolVersion ver);
   SmallVector<Symbol *, 0> findAllByVersion(SymbolVersion ver,
@@ -96,6 +104,11 @@ private:
   // when cross linking.
   llvm::DenseMap<llvm::CachedHashStringRef, int> symMap;
   SmallVector<Symbol *, 0> symVector;
+
+  // For the ODR checker.
+  std::vector<llvm::odrtable::InputFile> ODRTables;
+  llvm::thread ODRCheckerThread;
+  std::vector<llvm::odrtable::Diag> ODRDiags;
 
   // A map from demangled symbol names to their symbol objects.
   // This mapping is 1:N because two symbols with different versions

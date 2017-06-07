@@ -775,6 +775,10 @@ static bool isKnownSpecificSectionType(uint32_t t, uint32_t flags) {
   return SHT_LOPROC <= t && t <= SHT_HIPROC;
 }
 
+namespace {
+bool dontReadOdrTab = getenv("DONT_READ_ODRTAB");
+}
+
 template <class ELFT>
 void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
                                        const llvm::object::ELFFile<ELFT> &obj) {
@@ -829,6 +833,11 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
     }
     case SHT_SYMTAB_SHNDX:
       shndxTable = CHECK(obj.getSHNDXTable(sec, objSections), this);
+      break;
+    case SHT_LLVM_ODRTAB:
+      if (!dontReadOdrTab)
+        symtab.addODRTable(
+            this, CHECK(obj.getSectionContents(sec), toString(this)));
       break;
     case SHT_SYMTAB:
     case SHT_STRTAB:

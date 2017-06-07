@@ -305,6 +305,11 @@ void TargetLoweringObjectFileELF::getModuleMetadata(Module &M) {
 void TargetLoweringObjectFileELF::emitModuleMetadata(MCStreamer &Streamer,
                                                      Module &M) const {
   auto &C = getContext();
+  if (auto *ODRTables = M.getNamedMetadata("llvm.odrtab")) {
+    Streamer.switchSection(C.getELFSection(".odrtab", ELF::SHT_LLVM_ODRTAB, 0));
+    for (MDNode *Table : ODRTables->operands())
+      Streamer.emitBytes(cast<MDString>(Table->getOperand(0))->getString());
+  }
 
   if (NamedMDNode *LinkerOptions = M.getNamedMetadata("llvm.linker.options")) {
     auto *S = C.getELFSection(".linker-options", ELF::SHT_LLVM_LINKER_OPTIONS,

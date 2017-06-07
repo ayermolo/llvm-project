@@ -2062,6 +2062,10 @@ def fdebug_pass_arguments : Flag<["-"], "fdebug-pass-arguments">, Group<f_Group>
 def fdebug_pass_structure : Flag<["-"], "fdebug-pass-structure">, Group<f_Group>;
 def fdepfile_entry : Joined<["-"], "fdepfile-entry=">,
     Group<f_clang_Group>, Visibility<[ClangOption, CC1Option]>;
+def fdetect_odr_violations : Flag<["-"], "fdetect-odr-violations">,
+    Group<f_clang_Group>, Visibility<[ClangOption, CC1Option]>;
+def fno_detect_odr_violations : Flag<["-"], "fno-detect-odr-violations">,
+    Group<f_clang_Group>, Visibility<[ClangOption]>;
 def fdiagnostics_fixit_info : Flag<["-"], "fdiagnostics-fixit-info">, Group<f_clang_Group>;
 def fno_diagnostics_fixit_info : Flag<["-"], "fno-diagnostics-fixit-info">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,

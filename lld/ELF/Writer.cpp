@@ -376,6 +376,7 @@ template <class ELFT> void Writer<ELFT>::run() {
     if (!config->cmseOutputLib.empty())
       writeARMCmseImportLib<ELFT>();
   }
+  symtab.finishODRChecker();
 }
 
 template <class ELFT, class RelTy>
