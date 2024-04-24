@@ -1761,6 +1761,9 @@ void CompilerInvocationBase::GenerateCodeGenArgs(const CodeGenOptions &Opts,
     GenerateArg(Consumer, OPT_fno_finite_loops);
     break;
   }
+
+  if (Opts.DetectODRViolations)
+    GenerateArg(Consumer, OPT_fdetect_odr_violations);
 }
 
 bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
@@ -2224,8 +2227,8 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
       options::OPT_mamdgpu_ieee, options::OPT_mno_amdgpu_ieee, true);
   if (!Opts.EmitIEEENaNCompliantInsts && !LangOptsRef.NoHonorNaNs)
     Diags.Report(diag::err_drv_amdgpu_ieee_without_no_honor_nans);
-
-  Opts.DetectODRViolations = Args.hasArg(OPT_fdetect_odr_violations);
+  if (Args.hasArg(OPT_fdetect_odr_violations))
+    Opts.DetectODRViolations = 1;
 
   return Diags.getNumErrors() == NumErrorsBefore;
 }

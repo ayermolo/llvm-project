@@ -2065,7 +2065,7 @@ def fdepfile_entry : Joined<["-"], "fdepfile-entry=">,
 def fdetect_odr_violations : Flag<["-"], "fdetect-odr-violations">,
     Group<f_clang_Group>, Visibility<[ClangOption, CC1Option]>;
 def fno_detect_odr_violations : Flag<["-"], "fno-detect-odr-violations">,
-    Group<f_clang_Group>, Visibility<[ClangOption]>;
+    Group<f_clang_Group>, Visibility<[ClangOption, CC1Option]>;
 def fdiagnostics_fixit_info : Flag<["-"], "fdiagnostics-fixit-info">, Group<f_clang_Group>;
 def fno_diagnostics_fixit_info : Flag<["-"], "fno-diagnostics-fixit-info">, Group<f_Group>,
   Visibility<[ClangOption, CC1Option]>,
