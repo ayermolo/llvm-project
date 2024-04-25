@@ -127,8 +127,8 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
       if (Hdr.Version != kCurrentVersion)
         return Diags;
       if (Producer.empty())
-        HdrProducer = Hdr.getProducer();
-      else if (HdrProducer != Hdr.getProducer())
+        Producer = HdrProducer;
+      else if (HdrProducer != Producer)
         // Don't bother checking odr for more than one producer at once.
         return Diags;
 
