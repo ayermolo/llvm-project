@@ -342,10 +342,11 @@ void SymbolTable::startODRChecker() {
   ODRCheckerThread = llvm::thread([&]() {
     ODRDiags = check(odrtable::check(ODRTables));
   });
+  ODRCheckerThread.join();
 }
 
 void SymbolTable::finishODRChecker() {
-  ODRCheckerThread.join();
+  //ODRCheckerThread.join();
   for (odrtable::Diag &diag : ODRDiags) {
     std::string msgStr;
     llvm::raw_string_ostream msg(msgStr);
