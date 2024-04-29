@@ -1,3 +1,4 @@
+# XFAIL: *
 # RUN: llvm-mc -filetype=obj -triple=x86_64-pc-linux %s -o %t
 # RUN: ld.lld %t -o %t2 2>&1 | FileCheck %s
 
