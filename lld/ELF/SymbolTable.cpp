@@ -338,6 +338,12 @@ Symbol *SymbolTable::addUnusedUndefined(StringRef name, uint8_t binding) {
   return addSymbol(Undefined{ctx.internalFile, name, binding, STV_DEFAULT, 0});
 }
 
+void SymbolTable::addODRTable(InputFile *File, ArrayRef<uint8_t> ODRTab) {
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lock(mu);
+  ODRTables.push_back({static_cast<void *>(File), ODRTab});
+}
+
 void SymbolTable::startODRChecker() {
   ODRCheckerThread = llvm::thread([&]() {
     ODRDiags = check(odrtable::check(ODRTables));

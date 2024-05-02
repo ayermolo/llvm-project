@@ -82,9 +82,7 @@ public:
   // output Arm CMSE import library.
   llvm::StringMap<bool> inCMSEOutImpLib;
 
-  void addODRTable(InputFile *File, ArrayRef<uint8_t> ODRTab) {
-    ODRTables.push_back({static_cast<void *>(File), ODRTab});
-  }
+  void addODRTable(InputFile *File, ArrayRef<uint8_t> ODRTab);
   void startODRChecker();
   void finishODRChecker();
 
