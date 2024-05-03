@@ -4505,8 +4505,18 @@ unsigned FunctionDecl::getMemoryFunctionKind() const {
 }
 
 unsigned FunctionDecl::getODRHash() const {
-  assert(hasODRHash());
-  return ODRHash;
+  if(hasODRHash())
+    return ODRHash;
+  unsigned TempODRHash;
+  if (auto *FT = getInstantiatedFromMemberFunction()) {
+    TempODRHash = FT->getODRHash();
+    return TempODRHash;
+  }
+
+  class ODRHash Hash;
+  Hash.AddFunctionDecl(this);
+  TempODRHash = Hash.CalculateHash();
+  return TempODRHash;
 }
 
 unsigned FunctionDecl::getODRHash() {

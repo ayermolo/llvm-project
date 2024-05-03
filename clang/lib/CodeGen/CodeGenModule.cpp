@@ -5983,6 +5983,13 @@ void CodeGenModule::HandleCXXStaticMemberVarInstantiation(VarDecl *VD) {
 void CodeGenModule::EmitGlobalFunctionDefinition(GlobalDecl GD,
                                                  llvm::GlobalValue *GV) {
   const auto *D = cast<FunctionDecl>(GD.getDecl());
+  if (CodeGenOpts.DetectODRViolations) {
+    StringRef MangledName = getMangledName(GD);
+    PresumedLoc PLoc =
+        Context.getSourceManager().getPresumedLoc(D->getLocation());
+    ODRTab.add(std::string(MangledName), PLoc.getFilename(), PLoc.getLine(),
+               D->getODRHash());
+  }
 
   // Compute the function info and LLVM type.
   const CGFunctionInfo &FI = getTypes().arrangeGlobalDeclaration(GD);
