@@ -55,7 +55,9 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
 
   struct ParsedInput {
     void *Source;
-    StringRef ZODRTab;
+    StringRef Strtab;
+    ArrayRef<storage::ZSymbol> Zsymbols;
+    bool isZODRTabInit;
     ArrayRef<uint8_t> CompressedZODRTab;
     size_t ZODRTabSize;
     ArrayRef<storage::Symbol> Symbols;
@@ -76,22 +78,30 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
   };
   StringMap<Symbol> Symtab;
 
+  StringTableBuilder StrtabBuilder{StringTableBuilder::ELF};
+  BumpPtrAllocator StrAlloc;
+  StringSaver Saver{StrAlloc};
+
   auto AddToSymtab = [&](ParsedInput &Input, size_t SymIndex) -> Error {
-    if (Input.ZODRTab.empty()) {
-      char *ZODRTab =
+    StringRef Strtab;
+    if (!Input.isZODRTabInit) {
+      char *ZODRTabChar =
           static_cast<char *>(ZODRTabAlloc.Allocate(Input.ZODRTabSize, 1));
       size_t Size = Input.ZODRTabSize;
-      if (Error Err = compression::zlib::decompress(Input.CompressedZODRTab, reinterpret_cast<uint8_t*>(ZODRTab), Size))
+      if (Error Err = compression::zlib::decompress(
+              Input.CompressedZODRTab, reinterpret_cast<uint8_t *>(ZODRTabChar),
+              Size))
         return Err;
-      Input.ZODRTab = {ZODRTab, Size};
+      StringRef ZODRTab = {ZODRTabChar, Size};
+      Strtab = ZODRTab.substr(Input.Symbols.size() * sizeof(storage::ZSymbol));
+      Input.Zsymbols = {
+          reinterpret_cast<const storage::ZSymbol *>(ZODRTab.data()),
+          Input.Symbols.size()};
+      Input.isZODRTabInit = true;
     }
 
-    StringRef Strtab =
-        Input.ZODRTab.substr(Input.Symbols.size() * sizeof(storage::ZSymbol));
-
     const storage::Symbol &SSym = Input.Symbols[SymIndex];
-    auto &ZSym = reinterpret_cast<const storage::ZSymbol *>(
-        Input.ZODRTab.data())[SymIndex];
+    auto &ZSym = Input.Zsymbols[SymIndex];
 
     StringRef Name = ZSym.Name.get(Strtab);
     Symbol InsSym = {
@@ -136,7 +146,8 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
       ArrayRef<uint8_t> ZODRTab(reinterpret_cast<const uint8_t*>(ODRTable.data()) + ZODRTabOffset,
                            Hdr.SymbolOffset - ZODRTabOffset);
       ArrayRef<storage::Symbol> Syms = Hdr.getSymbols();
-      ParsedInputs.push_back({I.Source, {}, ZODRTab, Hdr.ZODRTabSize, Syms});
+      ParsedInputs.push_back(
+          {I.Source, {}, {}, false, ZODRTab, Hdr.ZODRTabSize, Syms});
 
       for (unsigned I = 0; I != Syms.size(); ++I) {
         const storage::Symbol &Sym = Syms[I];
