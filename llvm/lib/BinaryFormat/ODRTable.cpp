@@ -2,7 +2,9 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Compression.h"
 #include "llvm/Support/xxhash.h"
+#include <cassert>
 #include <cstdint>
+#include <map>
 #include <set>
 
 using namespace llvm;
@@ -63,7 +65,6 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
     ArrayRef<storage::Symbol> Symbols;
   };
   std::vector<ParsedInput> ParsedInputs;
-  BumpPtrAllocator ZODRTabAlloc;
 
   struct HashSymbol {
     uint32_t ODRHash;
@@ -78,13 +79,18 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
   };
   StringMap<Symbol> Symtab;
 
-  StringTableBuilder StrtabBuilder{StringTableBuilder::ELF};
   BumpPtrAllocator StrAlloc;
   StringSaver Saver{StrAlloc};
-
-  auto AddToSymtab = [&](ParsedInput &Input, size_t SymIndex) -> Error {
+  llvm::DenseMap<uint64_t, StringRef> NameHashToNametMap;
+  std::map<unsigned, std::string> InputToFileNameMap;
+  // Addd unordered map of ParsedInputINdex to unorderd map of ZSym.File.Index
+  // to File string?
+  auto AddToSymtab = [&](unsigned InputIndex, size_t SymIndex) -> Error {
+    ParsedInput &Input = ParsedInputs[InputIndex];
+    const storage::Symbol &SSym = Input.Symbols[SymIndex];
     StringRef Strtab;
     if (!Input.isZODRTabInit) {
+      BumpPtrAllocator ZODRTabAlloc;
       char *ZODRTabChar =
           static_cast<char *>(ZODRTabAlloc.Allocate(Input.ZODRTabSize, 1));
       size_t Size = Input.ZODRTabSize;
@@ -98,14 +104,24 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
           reinterpret_cast<const storage::ZSymbol *>(ZODRTab.data()),
           Input.Symbols.size()};
       Input.isZODRTabInit = true;
+      assert(Input.Symbols.size() == Input.Zsymbols.size() &&
+             "Missmatch in size beteen Symbosl and ZSymbols");
+      for (unsigned Index = 0; Index < Input.Symbols.size(); ++Index) {
+        const storage::Symbol &SSymTemp = Input.Symbols[Index];
+        const storage::ZSymbol &ZSymTemp = Input.Zsymbols[Index];
+        StringRef Name = ZSymTemp.Name.get(Strtab);
+        uint64_t NameHash = SSymTemp.NameHash;
+        if (NameHashToNametMap.find(NameHash) == NameHashToNametMap.end())
+          NameHashToNametMap.insert({NameHash, Saver.save(Name)});
+      }
     }
 
-    const storage::Symbol &SSym = Input.Symbols[SymIndex];
     auto &ZSym = Input.Zsymbols[SymIndex];
-
-    StringRef Name = ZSym.Name.get(Strtab);
+    StringRef Name = NameHashToNametMap.lookup(SSym.NameHash);
+    auto Iter = InputToFileNameMap.insert(
+        {InputIndex, std::string(ZSym.File.get(Strtab))});
     Symbol InsSym = {
-        {SSym.ODRHash}, {Input.Source, std::string(ZSym.File.get(Strtab)), ZSym.Line}, -1u};
+        {SSym.ODRHash}, {Input.Source, Iter.first->second, ZSym.Line}, -1u};
     auto &Sym = Symtab.insert({Name, InsSym}).first->second;
     if (Sym.ODRHash.insert(SSym.ODRHash).second) {
       Diag *D;
@@ -158,12 +174,11 @@ Expected<std::vector<Diag>> odrtable::check(ArrayRef<InputFile> Inputs) {
         if (HashSym.ODRHash != Sym.ODRHash) {
           HashSym.ODRHash = Sym.ODRHash;
           if (HashSym.InputIndex != -1u) {
-            if (Error Err = AddToSymtab(ParsedInputs[HashSym.InputIndex],
-                                        HashSym.SymIndex))
+            if (Error Err = AddToSymtab(HashSym.InputIndex, HashSym.SymIndex))
               return std::move(Err);
             HashSym.InputIndex = -1u;
           }
-          if (Error Err = AddToSymtab(ParsedInputs.back(), I))
+          if (Error Err = AddToSymtab(ParsedInputs.size() - 1, I))
             return std::move(Err);
         }
       }
