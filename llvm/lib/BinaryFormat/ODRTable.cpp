@@ -17,7 +17,14 @@ void Builder::add(StringRef Name, StringRef File, unsigned Line, uint32_t ODRHas
   Sym.NameHash = xxHash64(Name);
   Sym.ODRHash = ODRHash;
   Syms.push_back(Sym);
-
+  const bool PrintOdrTable = getenv("PRINT_ODR_TABLE");
+  if (PrintOdrTable) {
+    dbgs() << "NameHash: 0x" << Twine::utohexstr(Sym.NameHash) << "\n";
+    dbgs() << "ODRHash:  0x" << Twine::utohexstr(ODRHash) << "\n";
+    dbgs() << "Name:     " << Name << "\n";
+    dbgs() << "File:     " << File << "\n";
+    dbgs() << "Line:     " << Line << "\n\n";
+  }
   storage::ZSymbol ZSym;
   setStr(ZSym.Name, Name);
   setStr(ZSym.File, File);
