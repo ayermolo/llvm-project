@@ -53,6 +53,7 @@
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/Win64EH.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cassert>
 #include <ctime>
 
 using namespace llvm;
@@ -86,6 +87,7 @@ public:
 
   void printFileHeaders() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printRelocations() override;
   void printUnwindInfo() override;
 
@@ -1503,6 +1505,10 @@ void COFFDumper::printCodeViewTypeSection(StringRef SectionName,
     reportError(std::move(E), Obj->getFileName());
 
   W.flush();
+}
+
+void COFFDumper::printODRTable() {
+  assert(false && "ODR table is not implemented for COFF");
 }
 
 void COFFDumper::printSectionHeaders() {

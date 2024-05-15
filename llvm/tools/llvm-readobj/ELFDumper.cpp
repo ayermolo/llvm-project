@@ -30,6 +30,7 @@
 #include "llvm/BinaryFormat/AMDGPUMetadataVerifier.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/BinaryFormat/MsgPackDocument.h"
+#include "llvm/BinaryFormat/ODRTable.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/ELF.h"
@@ -44,6 +45,7 @@
 #include "llvm/Support/ARMBuildAttributes.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/Compression.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
@@ -62,6 +64,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -589,6 +592,7 @@ public:
   void printGroupSections() override;
   void printRelocations() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printSymbols(bool PrintSymbols, bool PrintDynamicSymbols,
                     bool ExtraSymInfo) override;
   void printHashSymbols() override;
@@ -619,6 +623,7 @@ public:
                                bool IsGnu) const override;
 
 private:
+  const Elf_Shdr *findSectionByName(StringRef Name) const;
   void printHashTableSymbols(const Elf_Hash &HashTable);
   void printGnuHashTableSymbols(const Elf_GnuHash &GnuHashTable);
 
@@ -705,6 +710,7 @@ public:
   void printGroupSections() override;
   void printRelocations() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printSymbols(bool PrintSymbols, bool PrintDynamicSymbols,
                     bool ExtraSymInfo) override;
   void printDependentLibs() override;
@@ -4094,6 +4100,80 @@ static void printSectionDescription(formatted_raw_ostream &OS,
   OS << ", p (processor specific)\n";
 }
 
+template <class ELFT>
+const typename ELFT::Shdr *
+GNUELFDumper<ELFT>::findSectionByName(StringRef Name) const {
+  for (const Elf_Shdr &Shdr : cantFail(this->Obj.sections())) {
+    if (Expected<StringRef> NameOrErr = this->Obj.getSectionName(Shdr)) {
+      if (*NameOrErr == Name)
+        return &Shdr;
+    } else {
+      this->reportUniqueWarning("unable to read the name of " +
+                                this->describe(Shdr) + ": " +
+                                toString(NameOrErr.takeError()));
+    }
+  }
+  return nullptr;
+}
+
+template <class ELFT> void GNUELFDumper<ELFT>::printODRTable() {
+  const Elf_Shdr *StackMapSection = findSectionByName(".odrtab");
+  if (!StackMapSection)
+    return;
+  auto Warn = [&](Error &&E) {
+    this->reportUniqueWarning("unable to read the odr table " +
+                              this->describe(*StackMapSection) + ": " +
+                              toString(std::move(E)));
+  };
+
+  Expected<ArrayRef<uint8_t>> ContentOrErr =
+      this->Obj.getSectionContents(*StackMapSection);
+  if (!ContentOrErr) {
+    Warn(ContentOrErr.takeError());
+    return;
+  }
+  StringRef ODRTable = {reinterpret_cast<const char *>(ContentOrErr->data()),
+                        ContentOrErr->size()};
+  BumpPtrAllocator ZODRTabAlloc;
+  using namespace odrtable;
+  while (ODRTable.size() >= sizeof(odrtable::storage::Header)) {
+    auto &Hdr =
+        *reinterpret_cast<const odrtable::storage::Header *>(ODRTable.data());
+    StringRef HdrProducer = Hdr.getProducer();
+    OS << "HdrProducer: " << HdrProducer << "\n";
+    OS << "Version: " << static_cast<uint32_t>(Hdr.Version) << "\n";
+    size_t ZODRTabOffset =
+        sizeof(odrtable::storage::Header) + HdrProducer.size() + 1;
+    ArrayRef<uint8_t> ZODRTab(
+        reinterpret_cast<const uint8_t *>(ODRTable.data()) + ZODRTabOffset,
+        Hdr.SymbolOffset - ZODRTabOffset);
+    ArrayRef<odrtable::storage::Symbol> Syms = Hdr.getSymbols();
+    char *ZODRTabChar =
+        static_cast<char *>(ZODRTabAlloc.Allocate(Hdr.ZODRTabSize, 1));
+    size_t Size = Hdr.ZODRTabSize;
+    if (Error Err = compression::zlib::decompress(
+            ZODRTab, reinterpret_cast<uint8_t *>(ZODRTabChar), Size))
+      return;
+    StringRef ZODRTabUncompressed = {ZODRTabChar, Size};
+    StringRef Strtab =
+        ZODRTabUncompressed.substr(Syms.size() * sizeof(storage::ZSymbol));
+    ArrayRef<storage::ZSymbol> Zsymbols = {
+        reinterpret_cast<const storage::ZSymbol *>(ZODRTabUncompressed.data()),
+        Syms.size()};
+    for (unsigned Index = 0; Index < Syms.size(); ++Index) {
+      const storage::Symbol &Sym = Syms[Index];
+      const storage::ZSymbol &ZSym = Zsymbols[Index];
+      OS << "NameHash: 0x" << Twine::utohexstr(Sym.NameHash) << "\n";
+      OS << "ODRHash:  0x" << Twine::utohexstr(Sym.ODRHash) << "\n";
+      OS << "Name:     " << ZSym.Name.get(Strtab) << "\n";
+      OS << "File:     " << ZSym.File.get(Strtab) << "\n";
+      OS << "Line:     " << static_cast<uint32_t>(ZSym.Line) << "\n\n";
+    }
+    // Move to the next odr table.
+    ODRTable = ODRTable.substr(Hdr.size());
+  }
+}
+
 template <class ELFT> void GNUELFDumper<ELFT>::printSectionHeaders() {
   ArrayRef<Elf_Shdr> Sections = cantFail(this->Obj.sections());
   if (Sections.empty()) {
@@ -7245,6 +7325,10 @@ void LLVMELFDumper<ELFT>::printRelRelaReloc(const Relocation<ELFT> &R,
   } else {
     printDefaultRelRelaReloc(R, SymbolName, RelocName);
   }
+}
+
+template <class ELFT> void LLVMELFDumper<ELFT>::printODRTable() {
+  assert(false && "ODR table is not supported for this file type");
 }
 
 template <class ELFT> void LLVMELFDumper<ELFT>::printSectionHeaders() {

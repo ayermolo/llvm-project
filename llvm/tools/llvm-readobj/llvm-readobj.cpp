@@ -114,6 +114,7 @@ static bool Relocations;
 bool SectionData;
 static bool SectionDetails;
 static bool SectionHeaders;
+static bool ODRTable;
 bool SectionRelocations;
 bool SectionSymbols;
 static std::vector<std::string> StringDump;
@@ -231,6 +232,7 @@ static void parseOptions(const opt::InputArgList &Args) {
   opts::Relocations = Args.hasArg(OPT_relocs);
   opts::SectionData = Args.hasArg(OPT_section_data);
   opts::SectionDetails = Args.hasArg(OPT_section_details);
+  opts::ODRTable = Args.hasArg(OPT_odr_table);
   opts::SectionHeaders = Args.hasArg(OPT_section_headers);
   opts::SectionRelocations = Args.hasArg(OPT_section_relocations);
   opts::SectionSymbols = Args.hasArg(OPT_section_symbols);
@@ -419,6 +421,9 @@ static void dumpObject(ObjectFile &Obj, ScopedPrinter &Writer,
   // corrupt (e.g. truncated), we can't dump anything except the file header.
   if (!ContentErrString.empty())
     reportError(createError(ContentErrString), FileStr);
+
+  if (opts::ODRTable)
+    Dumper->printODRTable();
 
   if (opts::SectionDetails || opts::SectionHeaders) {
     if (opts::Output == opts::GNU && opts::SectionDetails)

@@ -61,6 +61,7 @@ public:
 
   void printFileHeaders() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printRelocations() override;
   void printUnwindInfo() override { llvm_unreachable("unimplemented"); }
   void printStackMap() const override { llvm_unreachable("unimplemented"); }
@@ -149,6 +150,10 @@ void WasmDumper::printSymbols(bool /*ExtraSymInfo*/) {
 
   for (const SymbolRef &Symbol : Obj->symbols())
     printSymbol(Symbol);
+}
+
+void WasmDumper::printODRTable() {
+  assert(false && "ODR table is not implemented for Wasm yet.");
 }
 
 void WasmDumper::printSectionHeaders() {

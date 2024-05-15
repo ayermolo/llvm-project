@@ -36,6 +36,7 @@ def relocs : FF<"relocs", "Display the relocation entries in the file">;
 def section_data : FF<"section-data", "Display section data for each section shown. This option has no effect for GNU style output">;
 def section_details : FF<"section-details", "Display the section details">;
 def section_headers : FF<"section-headers", "Display section headers">;
+def odr_table : FF<"odr-table", "Display ODR Table">;
 def section_mapping : FF<"section-mapping", "Display the section to segment mapping">;
 def section_mapping_EQ_false : FF<"section-mapping=false", "Don't display the section to segment mapping">, Flags<[HelpHidden]>;
 def section_relocations : FF<"section-relocations", "Display relocations for each section shown. This option has no effect for GNU style output">;

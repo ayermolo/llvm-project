@@ -33,6 +33,7 @@ public:
   void printFileHeaders() override;
   void printAuxiliaryHeader() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printRelocations() override;
   void printSymbols(bool ExtraSymInfo) override;
   void printDynamicSymbols() override;
@@ -141,6 +142,10 @@ void XCOFFDumper::printAuxiliaryHeader() {
     printAuxiliaryHeader(Obj.auxiliaryHeader64());
   else
     printAuxiliaryHeader(Obj.auxiliaryHeader32());
+}
+
+void XCOFFDumper::printODRTable() {
+  assert(false && "XCOFFDumper::printODRTable() not implemented");
 }
 
 void XCOFFDumper::printSectionHeaders() {

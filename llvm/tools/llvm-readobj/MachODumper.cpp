@@ -32,6 +32,7 @@ public:
 
   void printFileHeaders() override;
   void printSectionHeaders() override;
+  void printODRTable() override;
   void printRelocations() override;
   void printUnwindInfo() override;
   void printStackMap() const override;
@@ -461,6 +462,10 @@ void MachODumper::printFileHeaders(const MachHeader &Header) {
   W.printNumber("NumOfLoadCommands", Header.ncmds);
   W.printNumber("SizeOfLoadCommands", Header.sizeofcmds);
   W.printFlags("Flags", Header.flags, ArrayRef(MachOHeaderFlags));
+}
+
+void MachODumper::printODRTable() {
+  assert(false && "ODR table is not implemented for Mach-O");
 }
 
 void MachODumper::printSectionHeaders() { return printSectionHeaders(Obj); }

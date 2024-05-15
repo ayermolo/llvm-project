@@ -74,6 +74,7 @@ public:
                                 const object::Archive *A);
   virtual void printFileHeaders() = 0;
   virtual void printSectionHeaders() = 0;
+  virtual void printODRTable() = 0;
   virtual void printRelocations() = 0;
   virtual void printSymbols(bool PrintSymbols, bool PrintDynamicSymbols,
                             bool ExtraSymInfo) {
