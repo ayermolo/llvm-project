@@ -22,11 +22,11 @@
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallVector.h"
+#include "clang/AST/DeclBase.h"
 
 namespace clang {
 
 class APValue;
-class Decl;
 class IdentifierInfo;
 class NestedNameSpecifier;
 class Stmt;
@@ -95,7 +95,7 @@ public:
   void AddIdentifierInfo(const IdentifierInfo *II);
   void AddNestedNameSpecifier(const NestedNameSpecifier *NNS);
   void AddTemplateName(TemplateName Name);
-  void AddDeclarationName(DeclarationName Name, bool TreatAsDecl = false);
+  void AddDeclarationName(DeclarationName Name, bool TreatAsDecl = false, std::optional<Decl::Kind> DeclKind = std::nullopt);
   void AddTemplateArgument(TemplateArgument TA);
   void AddTemplateParameterList(const TemplateParameterList *TPL);
 
@@ -107,7 +107,7 @@ public:
   static bool isSubDeclToBeProcessed(const Decl *D, const DeclContext *Parent);
 
 private:
-  void AddDeclarationNameImpl(DeclarationName Name);
+  void AddDeclarationNameImpl(DeclarationName Name, std::optional<Decl::Kind> DeclKind = std::nullopt);
 };
 
 }  // end namespace clang

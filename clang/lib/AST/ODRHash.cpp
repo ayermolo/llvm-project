@@ -31,19 +31,25 @@ void ODRHash::AddIdentifierInfo(const IdentifierInfo *II) {
   ID.AddString(II->getName());
 }
 
-void ODRHash::AddDeclarationName(DeclarationName Name, bool TreatAsDecl) {
+void ODRHash::AddDeclarationName(DeclarationName Name, bool TreatAsDecl,
+                                 std::optional<Decl::Kind> DeclKind) {
   if (TreatAsDecl)
     // Matches the NamedDecl check in AddDecl
     AddBoolean(true);
 
-  AddDeclarationNameImpl(Name);
+  AddDeclarationNameImpl(Name, DeclKind);
 
   if (TreatAsDecl)
     // Matches the ClassTemplateSpecializationDecl check in AddDecl
     AddBoolean(false);
 }
 
-void ODRHash::AddDeclarationNameImpl(DeclarationName Name) {
+void ODRHash::AddDeclarationNameImpl(DeclarationName Name, std::optional<Decl::Kind> DeclKind) {
+  if (DeclKind && !Name.isEmpty() && DeclKind == Decl::Kind::Var &&
+      Name.getNameKind() == DeclarationName::Identifier) {
+    ID.AddInteger(Name.getNameKind());
+    return;
+  }
   // Index all DeclarationName and use index numbers to refer to them.
   auto Result = DeclNameMap.insert(std::make_pair(Name, DeclNameMap.size()));
   ID.AddInteger(Result.first->second);
@@ -301,7 +307,7 @@ public:
   }
 
   void VisitNamedDecl(const NamedDecl *D) {
-    Hash.AddDeclarationName(D->getDeclName());
+    Hash.AddDeclarationName(D->getDeclName(), false, D->getKind());
     Inherited::VisitNamedDecl(D);
   }
 
@@ -814,7 +820,7 @@ void ODRHash::AddDecl(const Decl *D) {
     return;
   }
 
-  AddDeclarationName(ND->getDeclName());
+  AddDeclarationName(ND->getDeclName(), false, D->getKind());
 
   const auto *Specialization =
             dyn_cast<ClassTemplateSpecializationDecl>(D);
