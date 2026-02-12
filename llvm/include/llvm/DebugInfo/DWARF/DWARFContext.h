@@ -293,6 +293,9 @@ public:
       MaxVersion = Version;
   }
 
+  /// Returns true if this context was created with thread-safe mode enabled.
+  bool isThreadSafe() const { return State->isThreadSafe(); }
+
   const DWARFUnitIndex &getCUIndex();
   DWARFGdbIndex &getGdbIndex();
   const DWARFUnitIndex &getTUIndex();

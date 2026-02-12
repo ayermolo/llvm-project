@@ -29,7 +29,9 @@
 #include "llvm/Support/DataExtractor.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/RWMutex.h"
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +40,330 @@
 
 using namespace llvm;
 using namespace dwarf;
+
+//===----------------------------------------------------------------------===//
+// DWARFUnitState implementations
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Thread-unsafe implementation of DWARFUnitState. This is the default
+/// implementation with zero overhead for single-threaded use.
+class ThreadUnsafeDWARFUnitState : public DWARFUnit::DWARFUnitState {
+protected:
+  /// The compile unit debug information entry items.
+  std::vector<DWARFDebugInfoEntry> DieArray;
+
+  /// Map from range's start address to end address and corresponding DIE.
+  std::map<uint64_t, std::pair<uint64_t, DWARFDie>> AddrDieMap;
+
+  /// Map from the location (interpreted DW_AT_location) of a DW_TAG_variable,
+  /// to the end address and the corresponding DIE.
+  std::map<uint64_t, std::pair<uint64_t, DWARFDie>> VariableDieMap;
+  DenseSet<uint64_t> RootsParsedForVariables;
+
+  /// Base address of the CU.
+  std::optional<object::SectionedAddress> BaseAddr;
+
+  /// The abbreviations for this unit.
+  mutable const DWARFAbbreviationDeclarationSet *Abbrevs = nullptr;
+
+  /// The DWO unit associated with this unit.
+  std::shared_ptr<DWARFUnit> DWO;
+
+public:
+  explicit ThreadUnsafeDWARFUnitState(DWARFUnit &Unit)
+      : DWARFUnitState(Unit) {}
+
+  bool isThreadSafe() const override { return false; }
+
+  /// Return the unit DIE directly from DieArray without going through
+  /// U.getUnitDIE(), which would re-enter State->tryExtractDIEsIfNeeded()
+  /// and deadlock when called from within a ThreadSafe method under its mutex.
+  /// Caller must ensure DIEs have already been extracted.
+  DWARFDie getUnitDIEDirect() {
+    return DieArray.empty() ? DWARFDie() : DWARFDie(&U, &DieArray[0]);
+  }
+
+  std::vector<DWARFDebugInfoEntry> &getDieArray() override { return DieArray; }
+  const std::vector<DWARFDebugInfoEntry> &getDieArray() const override {
+    return DieArray;
+  }
+
+  Error tryExtractDIEsIfNeeded(bool CUDieOnly) override;
+  void clearDIEs(bool KeepCUDie) override;
+  DWARFDie getSubroutineForAddress(uint64_t Address) override;
+  DWARFDie getVariableForAddress(uint64_t Address) override;
+  void updateAddressDieMap(DWARFDie Die) override;
+  void updateVariableDieMap(DWARFDie Die) override;
+  std::optional<object::SectionedAddress> getBaseAddress() override;
+  bool parseDWO(StringRef DWOAlternativeLocation) override;
+  DWARFUnit *getDWO() override { return DWO.get(); }
+  const DWARFAbbreviationDeclarationSet *getAbbreviations() const override;
+  void clear() override;
+};
+
+/// Thread-safe implementation of DWARFUnitState. Wraps all lazy operations
+/// with a reader-writer mutex using double-checked locking pattern.
+///
+/// Several State accessors (getBaseAddress, getAbbreviations,
+/// tryExtractDIEsIfNeeded) use a lockless fast path via atomic flags to avoid
+/// re-entrant deadlocks: base-class methods (updateAddressDieMap, parseDWO,
+/// etc.) may call back through DWARFUnit public APIs that route through
+/// State->getXXX(), which would try to re-acquire the mutex that is already
+/// held by the calling ThreadSafe method.  The atomic flags, once set with
+/// release semantics, allow those re-entrant reads to return the cached value
+/// without touching the mutex.
+class ThreadSafeDWARFUnitState : public ThreadUnsafeDWARFUnitState {
+  mutable sys::RWMutex Mutex;
+
+  // Atomic flags for lockless fast paths.  Each flag indicates that the
+  // corresponding lazy field has been resolved and will not change until
+  // clear() is called.  Using acquire/release ordering ensures the reader
+  // sees the fully-written field value.
+  mutable std::atomic<bool> BaseAddrResolved{false};
+  mutable std::atomic<bool> AbbrevsResolved{false};
+  // 0 = not extracted, 1 = CU die only, 2 = all dies.
+  std::atomic<int> DieExtractionLevel{0};
+
+public:
+  explicit ThreadSafeDWARFUnitState(DWARFUnit &Unit)
+      : ThreadUnsafeDWARFUnitState(Unit) {}
+
+  bool isThreadSafe() const override { return true; }
+
+  std::vector<DWARFDebugInfoEntry> &getDieArray() override {
+    // Note: Caller must ensure proper synchronization when modifying
+    return DieArray;
+  }
+
+  const std::vector<DWARFDebugInfoEntry> &getDieArray() const override {
+    return DieArray;
+  }
+
+  Error tryExtractDIEsIfNeeded(bool CUDieOnly) override {
+    // Lockless fast path — once DIEs are extracted the level never decreases
+    // (until clear(), which requires exclusive access).
+    int Level = DieExtractionLevel.load(std::memory_order_acquire);
+    if ((CUDieOnly && Level >= 1) || Level >= 2)
+      return Error::success();
+
+    // Read-lock fast path
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if ((CUDieOnly && !DieArray.empty()) || DieArray.size() > 1)
+        return Error::success();
+    }
+    // Slow path with write lock.
+    // We inline the base-class logic here so we can publish atomic flags
+    // at precisely the right points — specifically, between
+    // extractDIEsToVector and doPostDIEExtractInit — allowing re-entrant
+    // calls from doPostDIEExtractInit to use lockless fast paths.
+    sys::ScopedWriter WriteLock(Mutex);
+    // Re-check under write lock.
+    if ((CUDieOnly && !DieArray.empty()) || DieArray.size() > 1)
+      return Error::success();
+
+    // Pre-resolve abbreviations and publish the atomic flag immediately.
+    if (!Abbrevs)
+      ThreadUnsafeDWARFUnitState::getAbbreviations();
+    AbbrevsResolved.store(true, std::memory_order_release);
+
+    // Extract DIEs into the array.
+    bool HasCUDie = !DieArray.empty();
+    U.extractDIEsToVector(!HasCUDie, !CUDieOnly, DieArray, Abbrevs);
+
+    if (DieArray.empty())
+      return Error::success();
+
+    // Publish the extraction level NOW — before doPostDIEExtractInit, whose
+    // callbacks (e.g. determineStringOffsetsTableContribution) may call
+    // getUnitDIE() → extractDIEsIfNeeded() → tryExtractDIEsIfNeeded().
+    int NewLevel = DieArray.size() > 1 ? 2 : (!DieArray.empty() ? 1 : 0);
+    DieExtractionLevel.store(NewLevel, std::memory_order_release);
+
+    if (HasCUDie)
+      return Error::success();
+
+    return U.doPostDIEExtractInit();
+  }
+
+  void clearDIEs(bool KeepCUDie) override {
+    sys::ScopedWriter WriteLock(Mutex);
+    ThreadUnsafeDWARFUnitState::clearDIEs(KeepCUDie);
+    int NewLevel = DieArray.size() > 1 ? 2 : (!DieArray.empty() ? 1 : 0);
+    DieExtractionLevel.store(NewLevel, std::memory_order_release);
+  }
+
+  DWARFDie getSubroutineForAddress(uint64_t Address) override {
+    // Ensure DIEs are extracted first (this is already thread-safe)
+    if (Error E = tryExtractDIEsIfNeeded(false)) {
+      U.getContext().getRecoverableErrorHandler()(std::move(E));
+      return DWARFDie();
+    }
+
+    // Pre-resolve base address before taking write lock so that
+    // updateAddressDieMap -> getAddressRanges -> findRnglistFromOffset ->
+    // getBaseAddress can use the lockless fast path.
+    U.getBaseAddress();
+
+    // Check if map needs population
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if (!AddrDieMap.empty()) {
+        auto R = AddrDieMap.upper_bound(Address);
+        if (R == AddrDieMap.begin())
+          return DWARFDie();
+        --R;
+        if (Address >= R->second.first)
+          return DWARFDie();
+        return R->second.second;
+      }
+    }
+
+    // Populate map with write lock.
+    // Use getUnitDIEDirect() to avoid re-entrant State locking; DIEs are
+    // already extracted by tryExtractDIEsIfNeeded above.
+    sys::ScopedWriter WriteLock(Mutex);
+    if (AddrDieMap.empty()) {
+      ThreadUnsafeDWARFUnitState::updateAddressDieMap(getUnitDIEDirect());
+    }
+    auto R = AddrDieMap.upper_bound(Address);
+    if (R == AddrDieMap.begin())
+      return DWARFDie();
+    --R;
+    if (Address >= R->second.first)
+      return DWARFDie();
+    return R->second.second;
+  }
+
+  DWARFDie getVariableForAddress(uint64_t Address) override {
+    // Ensure DIEs are extracted first
+    if (Error E = tryExtractDIEsIfNeeded(false)) {
+      U.getContext().getRecoverableErrorHandler()(std::move(E));
+      return DWARFDie();
+    }
+
+    // Pre-resolve base address for the lockless fast path (see
+    // getSubroutineForAddress comment above).
+    U.getBaseAddress();
+
+    auto RootDie = getUnitDIEDirect();
+    uint64_t RootOffset = RootDie.getOffset();
+
+    // Check if this root has been parsed
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if (RootsParsedForVariables.count(RootOffset)) {
+        auto R = VariableDieMap.upper_bound(Address);
+        if (R == VariableDieMap.begin())
+          return DWARFDie();
+        --R;
+        if (Address >= R->second.first)
+          return DWARFDie();
+        return R->second.second;
+      }
+    }
+
+    // Parse with write lock
+    sys::ScopedWriter WriteLock(Mutex);
+    auto RootLookup = RootsParsedForVariables.insert(RootOffset);
+    if (RootLookup.second) {
+      ThreadUnsafeDWARFUnitState::updateVariableDieMap(RootDie);
+    }
+    auto R = VariableDieMap.upper_bound(Address);
+    if (R == VariableDieMap.begin())
+      return DWARFDie();
+    --R;
+    if (Address >= R->second.first)
+      return DWARFDie();
+    return R->second.second;
+  }
+
+  void updateAddressDieMap(DWARFDie Die) override {
+    sys::ScopedWriter WriteLock(Mutex);
+    ThreadUnsafeDWARFUnitState::updateAddressDieMap(Die);
+  }
+
+  void updateVariableDieMap(DWARFDie Die) override {
+    sys::ScopedWriter WriteLock(Mutex);
+    ThreadUnsafeDWARFUnitState::updateVariableDieMap(Die);
+  }
+
+  std::optional<object::SectionedAddress> getBaseAddress() override {
+    // Lockless fast path — BaseAddr is set-once (until clear()).
+    if (BaseAddrResolved.load(std::memory_order_acquire))
+      return BaseAddr;
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if (BaseAddr) {
+        BaseAddrResolved.store(true, std::memory_order_release);
+        return BaseAddr;
+      }
+    }
+    // Ensure DIEs are extracted before acquiring write lock.
+    // The base method uses getUnitDIEDirect() which requires prior extraction.
+    if (Error E = tryExtractDIEsIfNeeded(true)) {
+      U.getContext().getRecoverableErrorHandler()(std::move(E));
+      return std::nullopt;
+    }
+    sys::ScopedWriter WriteLock(Mutex);
+    auto Result = ThreadUnsafeDWARFUnitState::getBaseAddress();
+    BaseAddrResolved.store(true, std::memory_order_release);
+    return Result;
+  }
+
+  bool parseDWO(StringRef DWOAlternativeLocation) override {
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if (DWO || U.isDWOUnit())
+        return false;
+    }
+    // Ensure DIEs are extracted before acquiring write lock.
+    // The base method uses getUnitDIEDirect() and U.getHeader().getDWOId(),
+    // which require DIEs to have been previously extracted.
+    if (Error E = tryExtractDIEsIfNeeded(true)) {
+      U.getContext().getRecoverableErrorHandler()(std::move(E));
+      return false;
+    }
+    sys::ScopedWriter WriteLock(Mutex);
+    return ThreadUnsafeDWARFUnitState::parseDWO(DWOAlternativeLocation);
+  }
+
+  DWARFUnit *getDWO() override {
+    sys::ScopedReader ReadLock(Mutex);
+    return DWO.get();
+  }
+
+  const DWARFAbbreviationDeclarationSet *getAbbreviations() const override {
+    // Lockless fast path — Abbrevs is set-once (until clear()).
+    if (AbbrevsResolved.load(std::memory_order_acquire))
+      return Abbrevs;
+    {
+      sys::ScopedReader ReadLock(Mutex);
+      if (Abbrevs) {
+        AbbrevsResolved.store(true, std::memory_order_release);
+        return Abbrevs;
+      }
+    }
+    sys::ScopedWriter WriteLock(Mutex);
+    auto *Result = ThreadUnsafeDWARFUnitState::getAbbreviations();
+    AbbrevsResolved.store(true, std::memory_order_release);
+    return Result;
+  }
+
+  void clear() override {
+    sys::ScopedWriter WriteLock(Mutex);
+    ThreadUnsafeDWARFUnitState::clear();
+    // Reset atomic fast-path flags.  clear() requires exclusive access
+    // (no concurrent readers), so resetting these is safe.
+    BaseAddrResolved.store(false, std::memory_order_release);
+    AbbrevsResolved.store(false, std::memory_order_release);
+    DieExtractionLevel.store(0, std::memory_order_release);
+  }
+};
+
+} // anonymous namespace
 
 void DWARFUnitVector::addUnitsForSection(DWARFContext &C,
                                          const DWARFSection &Section,
@@ -105,14 +431,16 @@ void DWARFUnitVector::addUnitsImpl(
         }
       }
       std::unique_ptr<DWARFUnit> U;
+      bool ThreadSafe = Context.isThreadSafe();
       if (Header.isTypeUnit())
         U = std::make_unique<DWARFTypeUnit>(Context, InfoSection, Header, DA,
                                              RS, LocSection, SS, SOS, AOS, LS,
-                                             LE, IsDWO, *this);
+                                             LE, IsDWO, *this, ThreadSafe);
       else
         U = std::make_unique<DWARFCompileUnit>(Context, InfoSection, Header,
                                                 DA, RS, LocSection, SS, SOS,
-                                                AOS, LS, LE, IsDWO, *this);
+                                                AOS, LS, LE, IsDWO, *this,
+                                                ThreadSafe);
       return U;
     };
   }
@@ -204,11 +532,16 @@ DWARFUnit::DWARFUnit(DWARFContext &DC, const DWARFSection &Section,
                      const DWARFSection *RS, const DWARFSection *LocSection,
                      StringRef SS, const DWARFSection &SOS,
                      const DWARFSection *AOS, const DWARFSection &LS, bool LE,
-                     bool IsDWO, const DWARFUnitVector &UnitVector)
+                     bool IsDWO, const DWARFUnitVector &UnitVector,
+                     bool ThreadSafe)
     : Context(DC), InfoSection(Section), Header(Header), Abbrev(DA),
       RangeSection(RS), LineSection(LS), StringSection(SS),
       StringOffsetSection(SOS), AddrOffsetSection(AOS), IsLittleEndian(LE),
       IsDWO(IsDWO), UnitVector(UnitVector) {
+  if (ThreadSafe)
+    State = std::make_unique<ThreadSafeDWARFUnitState>(*this);
+  else
+    State = std::make_unique<ThreadUnsafeDWARFUnitState>(*this);
   clear();
 }
 
@@ -385,7 +718,7 @@ Error DWARFUnitHeader::applyIndexEntry(const DWARFUnitIndex::Entry *Entry) {
 Error DWARFUnit::extractRangeList(uint64_t RangeListOffset,
                                   DWARFDebugRangeList &RangeList) const {
   // Require that compile unit is extracted.
-  assert(!DieArray.empty());
+  assert(!State->getDieArray().empty());
   DWARFDataExtractor RangesData(Context.getDWARFObj(), *RangeSection,
                                 IsLittleEndian, getAddressByteSize());
   uint64_t ActualRangeListOffset = RangeSectionBase + RangeListOffset;
@@ -393,17 +726,11 @@ Error DWARFUnit::extractRangeList(uint64_t RangeListOffset,
 }
 
 void DWARFUnit::clear() {
-  Abbrevs = nullptr;
-  BaseAddr.reset();
   RangeSectionBase = 0;
   LocSectionBase = 0;
   AddrOffsetSectionBase = std::nullopt;
   SU = nullptr;
-  clearDIEs(false);
-  AddrDieMap.clear();
-  if (DWO)
-    DWO->clear();
-  DWO.reset();
+  State->clear();
 }
 
 const char *DWARFUnit::getCompilationDir() {
@@ -412,7 +739,8 @@ const char *DWARFUnit::getCompilationDir() {
 
 void DWARFUnit::extractDIEsToVector(
     bool AppendCUDie, bool AppendNonCUDies,
-    std::vector<DWARFDebugInfoEntry> &Dies) const {
+    std::vector<DWARFDebugInfoEntry> &Dies,
+    const DWARFAbbreviationDeclarationSet *Abbrevs) const {
   if (!AppendCUDie && !AppendNonCUDies)
     return;
 
@@ -446,7 +774,7 @@ void DWARFUnit::extractDIEsToVector(
 
     // Extract die. Stop if any error occurred.
     if (!DIE.extractFast(*this, &DIEOffset, DebugInfoData, NextCUOffset,
-                         Parents.back()))
+                         Parents.back(), Abbrevs))
       break;
 
     // If previous sibling is remembered then update it`s SiblingIdx field.
@@ -499,16 +827,26 @@ void DWARFUnit::extractDIEsToVector(
 }
 
 void DWARFUnit::extractDIEsIfNeeded(bool CUDieOnly) {
-  if (Error e = tryExtractDIEsIfNeeded(CUDieOnly))
+  if (Error e = State->tryExtractDIEsIfNeeded(CUDieOnly))
     Context.getRecoverableErrorHandler()(std::move(e));
 }
 
-Error DWARFUnit::tryExtractDIEsIfNeeded(bool CUDieOnly) {
+//===----------------------------------------------------------------------===//
+// ThreadUnsafeDWARFUnitState method implementations
+//===----------------------------------------------------------------------===//
+
+Error ThreadUnsafeDWARFUnitState::tryExtractDIEsIfNeeded(bool CUDieOnly) {
   if ((CUDieOnly && !DieArray.empty()) || DieArray.size() > 1)
     return Error::success(); // Already parsed.
 
   bool HasCUDie = !DieArray.empty();
-  extractDIEsToVector(!HasCUDie, !CUDieOnly, DieArray);
+  // Resolve abbreviations up front via non-virtual call so that
+  // extractDIEsToVector / extractFast can use them without calling back
+  // through U.getAbbreviations() -> State->getAbbreviations(), which would
+  // deadlock when the ThreadSafe override already holds the mutex.
+  if (!Abbrevs)
+    ThreadUnsafeDWARFUnitState::getAbbreviations();
+  U.extractDIEsToVector(!HasCUDie, !CUDieOnly, DieArray, Abbrevs);
 
   if (DieArray.empty())
     return Error::success();
@@ -517,6 +855,11 @@ Error DWARFUnit::tryExtractDIEsIfNeeded(bool CUDieOnly) {
   if (HasCUDie)
     return Error::success();
 
+  return U.doPostDIEExtractInit();
+}
+
+Error DWARFUnit::doPostDIEExtractInit() {
+  auto &DieArray = State->getDieArray();
   DWARFDie UnitDie(this, &DieArray[0]);
   if (std::optional<uint64_t> DWOId =
           toUnsigned(UnitDie.find(DW_AT_GNU_dwo_id)))
@@ -607,15 +950,22 @@ Error DWARFUnit::tryExtractDIEsIfNeeded(bool CUDieOnly) {
   return Error::success();
 }
 
-bool DWARFUnit::parseDWO(StringRef DWOAlternativeLocation) {
-  if (IsDWO)
+bool ThreadUnsafeDWARFUnitState::parseDWO(StringRef DWOAlternativeLocation) {
+  if (U.isDWOUnit())
     return false;
   if (DWO)
     return false;
-  DWARFDie UnitDie = getUnitDIE();
+  // Use non-virtual tryExtractDIEsIfNeeded and getUnitDIEDirect() instead of
+  // U.getUnitDIE() to avoid re-entrant locking when called from
+  // ThreadSafeDWARFUnitState::parseDWO under its mutex.
+  if (Error E = ThreadUnsafeDWARFUnitState::tryExtractDIEsIfNeeded(true)) {
+    U.getContext().getRecoverableErrorHandler()(std::move(E));
+    return false;
+  }
+  DWARFDie UnitDie = getUnitDIEDirect();
   if (!UnitDie)
     return false;
-  auto DWOFileName = getVersion() >= 5
+  auto DWOFileName = U.getVersion() >= 5
                          ? dwarf::toString(UnitDie.find(DW_AT_dwo_name))
                          : dwarf::toString(UnitDie.find(DW_AT_GNU_dwo_name));
   if (!DWOFileName)
@@ -627,10 +977,10 @@ bool DWARFUnit::parseDWO(StringRef DWOAlternativeLocation) {
     sys::path::append(AbsolutePath, *CompilationDir);
   }
   sys::path::append(AbsolutePath, *DWOFileName);
-  auto DWOId = getDWOId();
+  auto DWOId = U.getDWOId();
   if (!DWOId)
     return false;
-  auto DWOContext = Context.getDWOContext(AbsolutePath);
+  auto DWOContext = U.getContext().getDWOContext(AbsolutePath);
   if (!DWOContext) {
     // Use the alternative location to get the DWARF context for the DWO object.
     if (DWOAlternativeLocation.empty())
@@ -638,7 +988,7 @@ bool DWARFUnit::parseDWO(StringRef DWOAlternativeLocation) {
     // If the alternative context does not correspond to the original DWO object
     // (different hashes), the below 'getDWOCompileUnitForHash' call will catch
     // the issue, with a returned null context.
-    DWOContext = Context.getDWOContext(DWOAlternativeLocation);
+    DWOContext = U.getContext().getDWOContext(DWOAlternativeLocation);
     if (!DWOContext)
       return false;
   }
@@ -647,19 +997,20 @@ bool DWARFUnit::parseDWO(StringRef DWOAlternativeLocation) {
   if (!DWOCU)
     return false;
   DWO = std::shared_ptr<DWARFCompileUnit>(std::move(DWOContext), DWOCU);
-  DWO->setSkeletonUnit(this);
+  DWO->setSkeletonUnit(&U);
   // Share .debug_addr and .debug_ranges section with compile unit in .dwo
-  if (AddrOffsetSectionBase)
-    DWO->setAddrOffsetSection(AddrOffsetSection, *AddrOffsetSectionBase);
-  if (getVersion() == 4) {
+  if (U.getAddrOffsetSectionBase())
+    DWO->setAddrOffsetSection(U.getAddrOffsetSectionPtr(),
+                              *U.getAddrOffsetSectionBase());
+  if (U.getVersion() == 4) {
     auto DWORangesBase = UnitDie.getRangesBaseAttribute();
-    DWO->setRangesSection(RangeSection, DWORangesBase.value_or(0));
+    DWO->setRangesSection(U.getRangeSectionPtr(), DWORangesBase.value_or(0));
   }
 
   return true;
 }
 
-void DWARFUnit::clearDIEs(bool KeepCUDie) {
+void ThreadUnsafeDWARFUnitState::clearDIEs(bool KeepCUDie) {
   // Do not use resize() + shrink_to_fit() to free memory occupied by dies.
   // shrink_to_fit() is a *non-binding* request to reduce capacity() to size().
   // It depends on the implementation whether the request is fulfilled.
@@ -668,6 +1019,21 @@ void DWARFUnit::clearDIEs(bool KeepCUDie) {
   DieArray = (KeepCUDie && !DieArray.empty())
                  ? std::vector<DWARFDebugInfoEntry>({DieArray[0]})
                  : std::vector<DWARFDebugInfoEntry>();
+}
+
+void ThreadUnsafeDWARFUnitState::clear() {
+  Abbrevs = nullptr;
+  BaseAddr.reset();
+  // Use qualified call to avoid virtual dispatch — ThreadSafeDWARFUnitState::clear()
+  // already holds the mutex, and the ThreadSafe override of clearDIEs() would
+  // try to re-acquire it, deadlocking on the non-recursive shared_mutex.
+  ThreadUnsafeDWARFUnitState::clearDIEs(false);
+  AddrDieMap.clear();
+  VariableDieMap.clear();
+  RootsParsedForVariables.clear();
+  if (DWO)
+    DWO->clear();
+  DWO.reset();
 }
 
 Expected<DWARFAddressRangesVector>
@@ -736,7 +1102,7 @@ DWARFUnit::findLoclistFromOffset(uint64_t Offset) {
   return Result;
 }
 
-void DWARFUnit::updateAddressDieMap(DWARFDie Die) {
+void ThreadUnsafeDWARFUnitState::updateAddressDieMap(DWARFDie Die) {
   if (Die.isSubroutineDIE()) {
     auto DIERangesOrError = Die.getAddressRanges();
     if (DIERangesOrError) {
@@ -763,14 +1129,21 @@ void DWARFUnit::updateAddressDieMap(DWARFDie Die) {
   // be equal or smaller than the parent's range. With this assumption, when
   // adding one range into the map, it will at most split a range into 3
   // sub-ranges.
+  // Use qualified call to avoid virtual dispatch — ThreadSafeDWARFUnitState
+  // already holds the mutex, and the ThreadSafe override would re-lock.
   for (DWARFDie Child = Die.getFirstChild(); Child; Child = Child.getSibling())
-    updateAddressDieMap(Child);
+    ThreadUnsafeDWARFUnitState::updateAddressDieMap(Child);
 }
 
-DWARFDie DWARFUnit::getSubroutineForAddress(uint64_t Address) {
-  extractDIEsIfNeeded(false);
+DWARFDie ThreadUnsafeDWARFUnitState::getSubroutineForAddress(uint64_t Address) {
+  // Use non-virtual tryExtractDIEsIfNeeded and getUnitDIEDirect() to avoid
+  // re-entrant locking when called from ThreadSafeDWARFUnitState under mutex.
+  if (Error E = ThreadUnsafeDWARFUnitState::tryExtractDIEsIfNeeded(false)) {
+    U.getContext().getRecoverableErrorHandler()(std::move(E));
+    return DWARFDie();
+  }
   if (AddrDieMap.empty())
-    updateAddressDieMap(getUnitDIE());
+    updateAddressDieMap(getUnitDIEDirect());
   auto R = AddrDieMap.upper_bound(Address);
   if (R == AddrDieMap.begin())
     return DWARFDie();
@@ -781,11 +1154,13 @@ DWARFDie DWARFUnit::getSubroutineForAddress(uint64_t Address) {
   return R->second.second;
 }
 
-void DWARFUnit::updateVariableDieMap(DWARFDie Die) {
+void ThreadUnsafeDWARFUnitState::updateVariableDieMap(DWARFDie Die) {
+  // Use qualified calls to avoid virtual dispatch — ThreadSafeDWARFUnitState
+  // already holds the mutex, and the ThreadSafe override would re-lock.
   for (DWARFDie Child : Die) {
     if (isType(Child.getTag()))
       continue;
-    updateVariableDieMap(Child);
+    ThreadUnsafeDWARFUnitState::updateVariableDieMap(Child);
   }
 
   if (Die.getTag() != DW_TAG_variable)
@@ -802,8 +1177,8 @@ void DWARFUnit::updateVariableDieMap(DWARFDie Die) {
   uint64_t Address = UINT64_MAX;
 
   for (const DWARFLocationExpression &Location : *Locations) {
-    uint8_t AddressSize = getAddressByteSize();
-    DataExtractor Data(Location.Expr, isLittleEndian(), AddressSize);
+    uint8_t AddressSize = U.getAddressByteSize();
+    DataExtractor Data(Location.Expr, U.isLittleEndian(), AddressSize);
     DWARFExpression Expr(Data, AddressSize);
     auto It = Expr.begin();
     if (It == Expr.end())
@@ -820,7 +1195,7 @@ void DWARFUnit::updateVariableDieMap(DWARFDie Die) {
       LocationAddr = It->getRawOperand(0);
     } else if (It->getCode() == dwarf::DW_OP_addrx) {
       uint64_t DebugAddrOffset = It->getRawOperand(0);
-      if (auto Pointer = getAddrOffsetSectionItem(DebugAddrOffset)) {
+      if (auto Pointer = U.getAddrOffsetSectionItem(DebugAddrOffset)) {
         LocationAddr = Pointer->Address;
       }
     } else {
@@ -848,17 +1223,22 @@ void DWARFUnit::updateVariableDieMap(DWARFDie Die) {
   // exact address.
   uint64_t GVSize = 1;
   if (Die.getAttributeValueAsReferencedDie(DW_AT_type))
-    if (std::optional<uint64_t> Size = Die.getTypeSize(getAddressByteSize()))
+    if (std::optional<uint64_t> Size = Die.getTypeSize(U.getAddressByteSize()))
       GVSize = *Size;
 
   if (Address != UINT64_MAX)
     VariableDieMap[Address] = {Address + GVSize, Die};
 }
 
-DWARFDie DWARFUnit::getVariableForAddress(uint64_t Address) {
-  extractDIEsIfNeeded(false);
+DWARFDie ThreadUnsafeDWARFUnitState::getVariableForAddress(uint64_t Address) {
+  // Use non-virtual tryExtractDIEsIfNeeded and getUnitDIEDirect() to avoid
+  // re-entrant locking when called from ThreadSafeDWARFUnitState under mutex.
+  if (Error E = ThreadUnsafeDWARFUnitState::tryExtractDIEsIfNeeded(false)) {
+    U.getContext().getRecoverableErrorHandler()(std::move(E));
+    return DWARFDie();
+  }
 
-  auto RootDie = getUnitDIE();
+  auto RootDie = getUnitDIEDirect();
 
   auto RootLookup = RootsParsedForVariables.insert(RootDie.getOffset());
   if (RootLookup.second)
@@ -883,6 +1263,7 @@ DWARFUnit::getInlinedChainForAddress(uint64_t Address,
   parseDWO();
   // First, find the subroutine that contains the given address (the leaf
   // of inlined chain).
+  DWARFUnit *DWO = State->getDWO();
   DWARFDie SubroutineDIE =
       (DWO ? *DWO : *this).getSubroutineForAddress(Address);
 
@@ -916,6 +1297,7 @@ const DWARFDebugInfoEntry *
 DWARFUnit::getParentEntry(const DWARFDebugInfoEntry *Die) const {
   if (!Die)
     return nullptr;
+  const auto &DieArray = State->getDieArray();
   assert(Die >= DieArray.data() && Die < DieArray.data() + DieArray.size());
 
   if (std::optional<uint32_t> ParentIdx = Die->getParentIdx()) {
@@ -938,6 +1320,7 @@ const DWARFDebugInfoEntry *
 DWARFUnit::getSiblingEntry(const DWARFDebugInfoEntry *Die) const {
   if (!Die)
     return nullptr;
+  const auto &DieArray = State->getDieArray();
   assert(Die >= DieArray.data() && Die < DieArray.data() + DieArray.size());
 
   if (std::optional<uint32_t> SiblingIdx = Die->getSiblingIdx()) {
@@ -960,6 +1343,7 @@ const DWARFDebugInfoEntry *
 DWARFUnit::getPreviousSiblingEntry(const DWARFDebugInfoEntry *Die) const {
   if (!Die)
     return nullptr;
+  const auto &DieArray = State->getDieArray();
   assert(Die >= DieArray.data() && Die < DieArray.data() + DieArray.size());
 
   std::optional<uint32_t> ParentIdx = Die->getParentIdx();
@@ -999,6 +1383,7 @@ const DWARFDebugInfoEntry *
 DWARFUnit::getFirstChildEntry(const DWARFDebugInfoEntry *Die) const {
   if (!Die)
     return nullptr;
+  const auto &DieArray = State->getDieArray();
   assert(Die >= DieArray.data() && Die < DieArray.data() + DieArray.size());
 
   if (!Die->hasChildren())
@@ -1024,6 +1409,7 @@ const DWARFDebugInfoEntry *
 DWARFUnit::getLastChildEntry(const DWARFDebugInfoEntry *Die) const {
   if (!Die)
     return nullptr;
+  const auto &DieArray = State->getDieArray();
   assert(Die >= DieArray.data() && Die < DieArray.data() + DieArray.size());
 
   if (!Die->hasChildren())
@@ -1058,10 +1444,12 @@ DWARFUnit::getLastChildEntry(const DWARFDebugInfoEntry *Die) const {
   return nullptr;
 }
 
-const DWARFAbbreviationDeclarationSet *DWARFUnit::getAbbreviations() const {
+const DWARFAbbreviationDeclarationSet *
+ThreadUnsafeDWARFUnitState::getAbbreviations() const {
   if (!Abbrevs) {
     Expected<const DWARFAbbreviationDeclarationSet *> AbbrevsOrError =
-        Abbrev->getAbbreviationDeclarationSet(getAbbreviationsOffset());
+        U.getDebugAbbrevPtr()->getAbbreviationDeclarationSet(
+            U.getAbbreviationsOffset());
     if (!AbbrevsOrError) {
       // FIXME: We should propagate this error upwards.
       consumeError(AbbrevsOrError.takeError());
@@ -1072,11 +1460,26 @@ const DWARFAbbreviationDeclarationSet *DWARFUnit::getAbbreviations() const {
   return Abbrevs;
 }
 
-std::optional<object::SectionedAddress> DWARFUnit::getBaseAddress() {
+std::optional<object::SectionedAddress>
+ThreadUnsafeDWARFUnitState::getBaseAddress() {
   if (BaseAddr)
     return BaseAddr;
 
-  DWARFDie UnitDie = (SU ? SU : this)->getUnitDIE();
+  // Use non-virtual tryExtractDIEsIfNeeded and getUnitDIEDirect() for the
+  // current unit to avoid re-entrant locking when called from
+  // ThreadSafeDWARFUnitState::getBaseAddress under its mutex.
+  // For the skeleton unit (a different unit with its own mutex), getUnitDIE()
+  // is safe.
+  DWARFDie UnitDie;
+  if (DWARFUnit *Skeleton = U.getSkeletonUnit()) {
+    UnitDie = Skeleton->getUnitDIE();
+  } else {
+    if (Error E = ThreadUnsafeDWARFUnitState::tryExtractDIEsIfNeeded(true)) {
+      U.getContext().getRecoverableErrorHandler()(std::move(E));
+      return std::nullopt;
+    }
+    UnitDie = getUnitDIEDirect();
+  }
   std::optional<DWARFFormValue> PC =
       UnitDie.find({DW_AT_low_pc, DW_AT_entry_pc});
   BaseAddr = toSectionedAddress(PC);
@@ -1165,7 +1568,12 @@ parseDWARFStringOffsetsTableHeader(DWARFDataExtractor &DA,
 Expected<std::optional<StrOffsetsContributionDescriptor>>
 DWARFUnit::determineStringOffsetsTableContribution(DWARFDataExtractor &DA) {
   assert(!IsDWO);
-  auto OptOffset = toSectionOffset(getUnitDIE().find(DW_AT_str_offsets_base));
+  // Use getDieArray() directly instead of getUnitDIE() to avoid re-entrant
+  // locking when called from doPostDIEExtractInit under the State's mutex.
+  // DIEs are guaranteed to be extracted at this point.
+  auto &DieArr = State->getDieArray();
+  DWARFDie UD = DieArr.empty() ? DWARFDie() : DWARFDie(this, &DieArr[0]);
+  auto OptOffset = toSectionOffset(UD.find(DW_AT_str_offsets_base));
   if (!OptOffset)
     return std::nullopt;
   auto DescOrError =

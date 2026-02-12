@@ -21,7 +21,9 @@ using namespace dwarf;
 
 bool DWARFDebugInfoEntry::extractFast(const DWARFUnit &U, uint64_t *OffsetPtr,
                                       const DWARFDataExtractor &DebugInfoData,
-                                      uint64_t UEndOffset, uint32_t ParentIdx) {
+                                      uint64_t UEndOffset, uint32_t ParentIdx,
+                                      const DWARFAbbreviationDeclarationSet
+                                          *AbbrevSet) {
   Offset = *OffsetPtr;
   this->ParentIdx = ParentIdx;
   if (Offset >= UEndOffset) {
@@ -40,7 +42,8 @@ bool DWARFDebugInfoEntry::extractFast(const DWARFUnit &U, uint64_t *OffsetPtr,
     AbbrevDecl = nullptr;
     return true;
   }
-  const auto *AbbrevSet = U.getAbbreviations();
+  if (!AbbrevSet)
+    AbbrevSet = U.getAbbreviations();
   if (!AbbrevSet) {
     U.getContext().getWarningHandler()(
         createStringError(errc::invalid_argument,

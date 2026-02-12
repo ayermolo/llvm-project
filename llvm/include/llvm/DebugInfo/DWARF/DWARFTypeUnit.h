@@ -28,9 +28,9 @@ public:
                 const DWARFSection *RS, const DWARFSection *LocSection,
                 StringRef SS, const DWARFSection &SOS, const DWARFSection *AOS,
                 const DWARFSection &LS, bool LE, bool IsDWO,
-                const DWARFUnitVector &UnitVector)
+                const DWARFUnitVector &UnitVector, bool ThreadSafe = false)
       : DWARFUnit(Context, Section, Header, DA, RS, LocSection, SS, SOS, AOS,
-                  LS, LE, IsDWO, UnitVector) {}
+                  LS, LE, IsDWO, UnitVector, ThreadSafe) {}
 
   uint64_t getTypeHash() const { return getHeader().getTypeHash(); }
   uint64_t getTypeOffset() const { return getHeader().getTypeOffset(); }

@@ -16,6 +16,7 @@
 
 namespace llvm {
 
+class DWARFAbbreviationDeclarationSet;
 class DWARFUnit;
 class DWARFDataExtractor;
 
@@ -39,9 +40,14 @@ public:
   /// starting at a given offset. If DIE can't be extracted, returns false and
   /// doesn't change OffsetPtr.
   /// High performance extraction should use this call.
+  /// If \p AbbrevSet is provided, it is used directly instead of calling
+  /// U.getAbbreviations(). This avoids re-entrant locking when called from
+  /// within a DWARFUnitState method that already holds the unit's mutex.
   LLVM_ABI bool extractFast(const DWARFUnit &U, uint64_t *OffsetPtr,
                             const DWARFDataExtractor &DebugInfoData,
-                            uint64_t UEndOffset, uint32_t ParentIdx);
+                            uint64_t UEndOffset, uint32_t ParentIdx,
+                            const DWARFAbbreviationDeclarationSet *AbbrevSet =
+                                nullptr);
 
   uint64_t getOffset() const { return Offset; }
 

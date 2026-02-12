@@ -216,6 +216,43 @@ struct StrOffsetsContributionDescriptor {
 };
 
 class LLVM_ABI DWARFUnit {
+public:
+  /// Abstract base class for unit state - handles all lazily-initialized data.
+  /// This allows for thread-safe and thread-unsafe implementations.
+  class DWARFUnitState {
+  protected:
+    DWARFUnit &U;
+
+  public:
+    explicit DWARFUnitState(DWARFUnit &Unit) : U(Unit) {}
+    virtual ~DWARFUnitState() = default;
+
+    // --- DIE extraction ---
+    virtual Error tryExtractDIEsIfNeeded(bool CUDieOnly) = 0;
+    virtual void clearDIEs(bool KeepCUDie) = 0;
+    virtual std::vector<DWARFDebugInfoEntry> &getDieArray() = 0;
+    virtual const std::vector<DWARFDebugInfoEntry> &getDieArray() const = 0;
+
+    // --- Address maps ---
+    virtual DWARFDie getSubroutineForAddress(uint64_t Address) = 0;
+    virtual DWARFDie getVariableForAddress(uint64_t Address) = 0;
+    virtual void updateAddressDieMap(DWARFDie Die) = 0;
+    virtual void updateVariableDieMap(DWARFDie Die) = 0;
+
+    // --- Other lazy state ---
+    virtual std::optional<object::SectionedAddress> getBaseAddress() = 0;
+    virtual bool parseDWO(StringRef DWOAlternativeLocation = {}) = 0;
+    virtual DWARFUnit *getDWO() = 0;
+    virtual const DWARFAbbreviationDeclarationSet *getAbbreviations() const = 0;
+
+    // --- Thread safety query ---
+    virtual bool isThreadSafe() const = 0;
+
+    // --- Clear all state ---
+    virtual void clear() = 0;
+  };
+
+private:
   DWARFContext &Context;
   /// Section containing this DWARFUnit.
   const DWARFSection &InfoSection;
@@ -244,25 +281,22 @@ class LLVM_ABI DWARFUnit {
   std::optional<StrOffsetsContributionDescriptor>
       StringOffsetsTableContribution;
 
-  mutable const DWARFAbbreviationDeclarationSet *Abbrevs;
-  std::optional<object::SectionedAddress> BaseAddr;
-  /// The compile unit debug information entry items.
-  std::vector<DWARFDebugInfoEntry> DieArray;
-
-  /// Map from range's start address to end address and corresponding DIE.
-  /// IntervalMap does not support range removal, as a result, we use the
-  /// std::map::upper_bound for address range lookup.
-  std::map<uint64_t, std::pair<uint64_t, DWARFDie>> AddrDieMap;
-
-  /// Map from the location (interpreted DW_AT_location) of a DW_TAG_variable,
-  /// to the end address and the corresponding DIE.
-  std::map<uint64_t, std::pair<uint64_t, DWARFDie>> VariableDieMap;
-  DenseSet<uint64_t> RootsParsedForVariables;
+  /// Polymorphic state object containing all lazily-initialized data.
+  /// Thread-safe or thread-unsafe depending on construction.
+  std::unique_ptr<DWARFUnitState> State;
 
   using die_iterator_range =
       iterator_range<std::vector<DWARFDebugInfoEntry>::iterator>;
 
-  std::shared_ptr<DWARFUnit> DWO;
+public:
+  /// Accessors for DWARFUnitState implementations (needed for thread-safe
+  /// state pattern).
+  const DWARFSection *getAddrOffsetSectionPtr() const {
+    return AddrOffsetSection;
+  }
+  const DWARFSection *getRangeSectionPtr() const { return RangeSection; }
+  const DWARFDebugAbbrev *getDebugAbbrevPtr() const { return Abbrev; }
+  DWARFUnit *getSkeletonUnit() const { return SU; }
 
 protected:
   friend dwarf_linker::parallel::CompileUnit;
@@ -274,6 +308,7 @@ protected:
   /// method on a DIE that isn't accessible by following
   /// children/sibling links starting from this unit's getUnitDIE().
   uint32_t getDIEIndex(const DWARFDebugInfoEntry *Die) const {
+    const auto &DieArray = State->getDieArray();
     auto First = DieArray.data();
     assert(Die >= First && Die < First + DieArray.size());
     return Die - First;
@@ -281,6 +316,7 @@ protected:
 
   /// Return DWARFDebugInfoEntry for the specified index \p Index.
   const DWARFDebugInfoEntry *getDebugInfoEntry(unsigned Index) const {
+    const auto &DieArray = State->getDieArray();
     assert(Index < DieArray.size());
     return &DieArray[Index];
   }
@@ -317,9 +353,12 @@ public:
             const DWARFSection *RS, const DWARFSection *LocSection,
             StringRef SS, const DWARFSection &SOS, const DWARFSection *AOS,
             const DWARFSection &LS, bool LE, bool IsDWO,
-            const DWARFUnitVector &UnitVector);
+            const DWARFUnitVector &UnitVector, bool ThreadSafe = false);
 
   virtual ~DWARFUnit();
+
+  /// Returns true if this unit was created with thread-safe state.
+  bool isThreadSafe() const { return State->isThreadSafe(); }
 
   bool isLittleEndian() const { return IsLittleEndian; }
   bool isDWOUnit() const { return IsDWO; }
@@ -374,10 +413,14 @@ public:
   }
 
   /// Recursively update address to Die map.
-  void updateAddressDieMap(DWARFDie Die);
+  void updateAddressDieMap(DWARFDie Die) {
+    State->updateAddressDieMap(Die);
+  }
 
   /// Recursively update address to variable Die map.
-  void updateVariableDieMap(DWARFDie Die);
+  void updateVariableDieMap(DWARFDie Die) {
+    State->updateVariableDieMap(Die);
+  }
 
   void setRangesSection(const DWARFSection *RS, uint64_t Base) {
     RangeSection = RS;
@@ -426,7 +469,9 @@ public:
 
   uint64_t getAbbreviationsOffset() const { return Header.getAbbrOffset(); }
 
-  const DWARFAbbreviationDeclarationSet *getAbbreviations() const;
+  const DWARFAbbreviationDeclarationSet *getAbbreviations() const {
+    return State->getAbbreviations();
+  }
 
   static bool isMatchingUnitTypeAndTag(uint8_t UnitType, dwarf::Tag Tag) {
     switch (UnitType) {
@@ -445,10 +490,13 @@ public:
     return false;
   }
 
-  std::optional<object::SectionedAddress> getBaseAddress();
+  std::optional<object::SectionedAddress> getBaseAddress() {
+    return State->getBaseAddress();
+  }
 
   DWARFDie getUnitDIE(bool ExtractUnitDIEOnly = true) {
     extractDIEsIfNeeded(ExtractUnitDIEOnly);
+    auto &DieArray = State->getDieArray();
     if (DieArray.empty())
       return DWARFDie();
     return DWARFDie(this, &DieArray[0]);
@@ -457,6 +505,7 @@ public:
   DWARFDie getNonSkeletonUnitDIE(bool ExtractUnitDIEOnly = true,
                                  StringRef DWOAlternativeLocation = {}) {
     parseDWO(DWOAlternativeLocation);
+    DWARFUnit *DWO = State->getDWO();
     return DWO ? DWO->getUnitDIE(ExtractUnitDIEOnly)
                : getUnitDIE(ExtractUnitDIEOnly);
   }
@@ -492,11 +541,15 @@ public:
   /// Returns subprogram DIE with address range encompassing the provided
   /// address. The pointer is alive as long as parsed compile unit DIEs are not
   /// cleared.
-  DWARFDie getSubroutineForAddress(uint64_t Address);
+  DWARFDie getSubroutineForAddress(uint64_t Address) {
+    return State->getSubroutineForAddress(Address);
+  }
 
   /// Returns variable DIE for the address provided. The pointer is alive as
   /// long as parsed compile unit DIEs are not cleared.
-  DWARFDie getVariableForAddress(uint64_t Address);
+  DWARFDie getVariableForAddress(uint64_t Address) {
+    return State->getVariableForAddress(Address);
+  }
 
   /// getInlinedChainForAddress - fetches inlined chain for a given address.
   /// Returns empty chain if there is no subprogram containing address. The
@@ -511,7 +564,7 @@ public:
   /// if necessary.
   unsigned getNumDIEs() {
     extractDIEsIfNeeded(false);
-    return DieArray.size();
+    return State->getDieArray().size();
   }
 
   /// Return the index of a DIE inside the unit's DIE vector.
@@ -538,9 +591,10 @@ public:
   /// Return the DIE object for a given offset \p Offset inside the
   /// unit's DIE vector.
   DWARFDie getDIEForOffset(uint64_t Offset) {
-    if (std::optional<uint32_t> DieIdx = getDIEIndexForOffset(Offset))
+    if (std::optional<uint32_t> DieIdx = getDIEIndexForOffset(Offset)) {
+      auto &DieArray = State->getDieArray();
       return DWARFDie(this, &DieArray[*DieIdx]);
-
+    }
     return DWARFDie();
   }
 
@@ -548,6 +602,7 @@ public:
   /// unit's DIE vector.
   std::optional<uint32_t> getDIEIndexForOffset(uint64_t Offset) {
     extractDIEsIfNeeded(false);
+    auto &DieArray = State->getDieArray();
     auto It =
         llvm::partition_point(DieArray, [=](const DWARFDebugInfoEntry &DIE) {
           return DIE.getOffset() < Offset;
@@ -566,12 +621,47 @@ public:
 
   die_iterator_range dies() {
     extractDIEsIfNeeded(false);
-    return DieArray;
+    return State->getDieArray();
   }
 
   virtual void dump(raw_ostream &OS, DIDumpOptions DumpOpts) = 0;
 
-  Error tryExtractDIEsIfNeeded(bool CUDieOnly);
+  Error tryExtractDIEsIfNeeded(bool CUDieOnly) {
+    return State->tryExtractDIEsIfNeeded(CUDieOnly);
+  }
+
+  /// extractDIEsIfNeeded - Parses a compile unit and indexes its DIEs if it
+  /// hasn't already been done
+  void extractDIEsIfNeeded(bool CUDieOnly);
+
+  /// clearDIEs - Clear parsed DIEs to keep memory usage low.
+  void clearDIEs(bool KeepCUDie) {
+    State->clearDIEs(KeepCUDie);
+  }
+
+  /// parseDWO - Parses .dwo file for current compile unit. Returns true if
+  /// it was actually constructed.
+  /// The \p AlternativeLocation specifies an alternative location to get
+  /// the DWARF context for the DWO object; this is the case when it has
+  /// been moved from its original location.
+  bool parseDWO(StringRef AlternativeLocation = {}) {
+    return State->parseDWO(AlternativeLocation);
+  }
+
+public:
+  /// extractDIEsToVector - Appends all parsed DIEs to a vector.
+  /// Public for use by DWARFUnitState implementations.
+  /// If \p Abbrevs is provided, it is passed through to extractFast to avoid
+  /// re-entrant calls to State->getAbbreviations() when the caller already
+  /// holds the unit's mutex.
+  void extractDIEsToVector(
+      bool AppendCUDie, bool AppendNonCUDIEs,
+      std::vector<DWARFDebugInfoEntry> &DIEs,
+      const DWARFAbbreviationDeclarationSet *Abbrevs = nullptr) const;
+
+  /// Perform post-extraction initialization after parsing the CU DIE.
+  /// Called by DWARFUnitState implementations.
+  Error doPostDIEExtractInit();
 
 private:
   /// Size in bytes of the .debug_info data associated with this compile unit.
@@ -579,24 +669,6 @@ private:
     return Header.getLength() + Header.getUnitLengthFieldByteSize() -
            getHeaderSize();
   }
-
-  /// extractDIEsIfNeeded - Parses a compile unit and indexes its DIEs if it
-  /// hasn't already been done
-  void extractDIEsIfNeeded(bool CUDieOnly);
-
-  /// extractDIEsToVector - Appends all parsed DIEs to a vector.
-  void extractDIEsToVector(bool AppendCUDie, bool AppendNonCUDIEs,
-                           std::vector<DWARFDebugInfoEntry> &DIEs) const;
-
-  /// clearDIEs - Clear parsed DIEs to keep memory usage low.
-  void clearDIEs(bool KeepCUDie);
-
-  /// parseDWO - Parses .dwo file for current compile unit. Returns true if
-  /// it was actually constructed.
-  /// The \p AlternativeLocation specifies an alternative location to get
-  /// the DWARF context for the DWO object; this is the case when it has
-  /// been moved from its original location.
-  bool parseDWO(StringRef AlternativeLocation = {});
 };
 
 inline bool isCompileUnit(const std::unique_ptr<DWARFUnit> &U) {
